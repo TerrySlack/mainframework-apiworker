@@ -1,368 +1,410 @@
-import { Queue, StoreSubject, StoreSubjects, WorkerConfig } from "../../types/types";
+/// <reference lib="webworker" />
 
-interface NestedRecord {
-  [key: string]:
-    | string
-    | number
-    | boolean
-    | File
-    | Blob
-    | Date
-    | FileList
-    | NestedRecord
-    | (string | number | boolean | File | Blob | Date | FileList | NestedRecord)[];
-}
-//Hold the classes created on each request passed to the worker
-const classQueue: Queue<ApiRequest> = {};
+import type {
+  AbortControllers,
+  BinaryParseResult,
+  BinaryResponseMeta,
+  DataRequest,
+  StackArray,
+  WorkerApiRequest,
+} from "../../types/types";
 
-// Define the store
-const store: StoreSubjects = {};
-
-const isBlobOrFile = <T>(value: T): boolean => value instanceof Blob || value instanceof File;
-
-const checkProperties = <T>(obj: T): boolean => {
-  if (obj === null || typeof obj === "undefined") return false;
-  if (Array.isArray(obj) || typeof obj === "object") {
-    for (const key in obj as Record<string, unknown>) {
-      if (Object.prototype.hasOwnProperty.call(obj, key)) {
-        const value = (obj as Record<string, unknown>)[key];
-        if (isBlobOrFile(value)) {
-          return true;
-        }
-        if (typeof value === "object" && value !== null && checkProperties(value)) {
-          return true;
-        }
-      }
-    }
+const callerResponse = <T>(cacheName: string, data: T, hookId?: string | null): void => {
+  if (data !== undefined && data !== null) {
+    self.postMessage({ cacheName, data, hookId });
   }
-
-  return false;
 };
 
-// Api Request class
-class ApiRequest {
-  private config: WorkerConfig;
+/**
+ * Binary response - transferred via postMessage, not stored in cache.
+ * Client receives ArrayBuffer + meta for reconstruction (e.g. new Blob([data], { type })).
+ */
+const callerResponseBinary = (
+  cacheName: string,
+  data: ArrayBuffer,
+  meta: BinaryResponseMeta,
+  hookId?: string | null,
+): void => {
+  if (data) {
+    self.postMessage({ cacheName, data, meta, hookId }, [data]);
+  }
+};
 
-  //Note the !. This indicates taht unsubscribe will be set elsewhere, outside the construtor
-  private unsubscribe!: () => void;
+const store: Record<string, unknown> = Object.create(null);
+const normalizeKey = (key: string) => key.toLocaleLowerCase();
+const get = <TData>(key: string): TData | undefined => store[normalizeKey(key)] as TData | undefined;
+const set = <TData>(key: string, value: TData): void => {
+  store[normalizeKey(key)] = value;
+};
+const remove = (key: string): void => {
+  delete store[normalizeKey(key)];
+};
 
-  constructor(config: WorkerConfig) {
-    this.config = config;
-    classQueue[this.config.cacheName.toString().toLocaleLowerCase()] = this;
-    this.init();
+/** Returns headers without Content-Type (either casing). Use when FormData sets it automatically. */
+const omitContentType = (headers: Record<string, string>): Record<string, string> => {
+  const { "Content-Type": _ct, "content-type": _ctLower, ...rest } = headers;
+  return rest;
+};
+
+const isBinaryResponse = (r: unknown): r is BinaryParseResult =>
+  !!r && typeof r === "object" && "__binary" in r && (r as { __binary: unknown }).__binary === true;
+
+const commit = <TData>(cacheName: string, data: TData, hookId?: string | null): void => {
+  if (cacheName) {
+    set(normalizeKey(cacheName), data);
+    callerResponse(cacheName, data, hookId);
+    return;
   }
 
-  private init() {
-    const { cacheName, mergeExisting, data, reset, method } = this.config;
-    const stringifiedCacheName = cacheName.toString().toLocaleLowerCase();
-    const subject = this.initializeStoreWithCacheName(stringifiedCacheName);
+  callerResponse("error", { error: "Invalid commit: cacheName is required", code: "INVALID_REQUEST" }, hookId);
+};
 
-    const subscribe = this.subScriberFactory(stringifiedCacheName);
-    this.unsubscribe = subject.subscribe(subscribe);
+/**
+ * Parses response based on content-type.
+ * Returns parsed data for JSON/text, or { __binary, data, contentType, contentDisposition } for binary.
+ */
+const parseResponseByContentType = async (response: Response): Promise<unknown | BinaryParseResult> => {
+  const contentType = response.headers.get("content-type")?.toLocaleLowerCase() || "";
+  const contentLength = response.headers.get("content-length");
 
-    if (reset && typeof subject?.value !== "undefined") {
-      this.reset(stringifiedCacheName);
-    }
-
-    if (method) {
-      this.requestAndUpdateStore(this.config, this.unsubscribe);
-    } else if (!method && Boolean(subject?.value)) {
-      this.polling(subject);
-    } else if (subject && data) {
-      if (mergeExisting) {
-        const mergedData = this.merge(subject.value, data, mergeExisting);
-        if (mergedData) this.polling(subject, mergedData);
-      } else {
-        this.polling(subject, data);
-      }
-    }
+  // No content
+  if (response.status === 204 || contentLength === "0") {
+    return null;
   }
 
-  private polling(subject: StoreSubject, data?: unknown) {
-    const interval = setInterval(() => {
-      if (!subject.lock) {
-        subject.lock = true;
-        subject.next(data ?? subject?.value);
-        subject.lock = false;
-        this.destroy();
-        clearInterval(interval);
-      }
-    }, 20);
+  // JSON types - let it throw if malformed
+  if (contentType.includes("json")) {
+    return await response.json();
   }
 
-  private reset(cacheName: string | number) {
-    const subject = store[cacheName.toString().toLocaleLowerCase()];
-    if (subject) {
-      subject.value = undefined;
-    }
+  // Text-based types
+  if (
+    contentType.startsWith("text/") ||
+    contentType.includes("xml") ||
+    contentType.includes("javascript") ||
+    contentType.includes("x-www-form-urlencoded")
+  ) {
+    return await response.text();
   }
 
-  private subScriberFactory = (cacheName: string | number) => (data: unknown) => {
-    if (data) {
-      postMessage({ cacheName, data });
-    }
+  // Binary types (known or fallback) - use arrayBuffer for zero-copy transfer to client
+  const arrayBuffer = await response.arrayBuffer();
+  return {
+    __binary: true as const,
+    data: arrayBuffer,
+    contentType,
+    contentDisposition: response.headers.get("content-disposition"),
   };
+};
 
-  private merge = (value: unknown, data: unknown, mergeExisting: boolean): unknown => {
-    if (mergeExisting && this.isObject(value) && this.isObject(data)) {
-      return { ...value, ...data };
-    } else if (mergeExisting && Array.isArray(value) && Array.isArray(data)) {
-      return [...value, ...data];
-    } else {
-      return data;
-    }
-  };
-
-  private initializeStoreWithCacheName(cacheName: string | number): StoreSubject {
-    const stringifiedCacheName = cacheName.toString().toLocaleLowerCase();
-    if (!store[stringifiedCacheName]) {
-      store[stringifiedCacheName] = this.createSubject(stringifiedCacheName);
-    }
-    return store[stringifiedCacheName];
+// Top-level helper
+const appendToFormData = (formData: FormData, key: string, value: unknown): void => {
+  if (value instanceof File) {
+    formData.append("Files", value, value.name);
+    return;
   }
 
-  private createSubject(cacheName: string | number): StoreSubject {
-    let subject = store[cacheName.toString().toLocaleLowerCase()];
-    const stringifiedCacheName = cacheName.toString().toLocaleLowerCase();
+  if (value instanceof Blob) {
+    formData.append("Files", value, "blob");
+    return;
+  }
 
-    if (!subject) {
-      subject = {
-        name: stringifiedCacheName,
-        lock: false,
-        value: undefined,
-        subscribers: [],
-        next: (value: unknown) => {
-          subject.value = value;
-          subject.subscribers.forEach((subscriber) => subscriber(value));
-        },
-        subscribe: (subscriber: (data: unknown) => void) => {
-          subject.subscribers.push(subscriber);
-          return () => {
-            subject.subscribers = subject.subscribers.filter((sub) => sub !== subscriber);
+  if (value !== undefined && value !== null) {
+    formData.append(key, String(value));
+  }
+};
+
+const pushObjectToStack = (
+  obj: Record<string, unknown>,
+  parentKey: string,
+  stack: Array<{ key: string; value: unknown }>,
+) => {
+  for (const k in obj) {
+    if (Object.prototype.hasOwnProperty.call(obj, k)) {
+      stack.push({
+        key: parentKey ? `${parentKey}.${k}` : k,
+        value: obj[k],
+      });
+    }
+  }
+};
+
+const createFormDataIfBlobOrFile = (payload: unknown): FormData | null => {
+  if (payload === null || payload === undefined || typeof payload !== "object") {
+    return null;
+  }
+
+  const formData = new FormData();
+  let hasFile = false;
+
+  const stack: StackArray[] = [];
+
+  if (Array.isArray(payload)) {
+    let i = 0;
+    while (i < payload.length) {
+      stack.push({ key: String(i), value: payload[i] });
+      i++;
+    }
+  } else {
+    pushObjectToStack(payload as Record<string, unknown>, "", stack);
+  }
+
+  // Safe iteration - iterate forward, then clear
+  for (let i = 0; i < stack.length; i++) {
+    const { key, value } = stack[i];
+
+    if (value instanceof File || value instanceof Blob) {
+      hasFile = true;
+      appendToFormData(formData, key, value);
+      continue;
+    }
+
+    if (Array.isArray(value)) {
+      let j = 0;
+      while (j < value.length) {
+        stack.push({ key: `${key}.${j}`, value: value[j] });
+        j++;
+      }
+      continue;
+    }
+
+    if (value !== null && typeof value === "object") {
+      pushObjectToStack(value as Record<string, unknown>, key, stack);
+      continue;
+    }
+
+    appendToFormData(formData, key, value);
+  }
+
+  return hasFile ? formData : null;
+};
+//Extracts Content-Type from headers object Returns "application/json" if not found
+const getContentType = (headers: Record<string, string> = {}): string =>
+  headers["Content-Type"] || headers["content-type"] || "application/json";
+
+const getPayloadType = (payload: unknown): string => {
+  switch (true) {
+    case payload instanceof FormData:
+      return "formdata";
+    case payload instanceof Blob:
+      return "blob";
+    case payload instanceof ArrayBuffer:
+      return "arraybuffer";
+    case ArrayBuffer.isView(payload):
+      return "arraybufferview";
+    case payload instanceof ReadableStream:
+      return "stream";
+    case typeof payload === "string":
+      return "string";
+    default:
+      return "object";
+  }
+};
+
+const prepareRequestBody = (
+  payload: unknown,
+  headers: Record<string, string>,
+): { body?: BodyInit; headers: Record<string, string> } => {
+  const payloadType = getPayloadType(payload);
+
+  switch (payloadType) {
+    case "formdata":
+      return {
+        body: payload as FormData,
+        headers: omitContentType(headers),
+      };
+
+    case "blob":
+      return {
+        body: payload as Blob,
+        headers,
+      };
+
+    case "arraybuffer":
+      return {
+        body: payload as ArrayBuffer,
+        headers,
+      };
+
+    case "arraybufferview":
+      return {
+        body: payload as unknown as BodyInit,
+        headers,
+      };
+
+    case "stream":
+      return {
+        body: payload as ReadableStream<Uint8Array>,
+        headers,
+      };
+
+    case "string":
+      return {
+        body: payload as string,
+        headers,
+      };
+
+    case "object": {
+      const contentType = getContentType(headers);
+      let body: BodyInit;
+      let finalHeaders = headers;
+
+      if (contentType.includes("application/json")) {
+        body = JSON.stringify(payload);
+      } else if (contentType.includes("application/x-www-form-urlencoded")) {
+        body = new URLSearchParams(payload as Record<string, string>).toString();
+      } else if (contentType.startsWith("text/") || contentType.includes("xml")) {
+        body = String(payload);
+      } else if (contentType.includes("multipart/form-data")) {
+        const formData = createFormDataIfBlobOrFile(payload);
+        if (formData) {
+          body = formData;
+          finalHeaders = omitContentType(headers);
+        } else {
+          body = JSON.stringify(payload);
+          finalHeaders = {
+            ...headers,
+            "Content-Type": "application/json",
           };
+        }
+      } else {
+        body = JSON.stringify(payload);
+      }
+
+      if (!finalHeaders["Content-Type"] && !finalHeaders["content-type"]) {
+        finalHeaders = {
+          ...headers,
+          "Content-Type": contentType,
+        };
+      }
+
+      return { body, headers: finalHeaders };
+    }
+
+    default:
+      return { headers };
+  }
+};
+
+const inFlightControllers: AbortControllers = new Map();
+
+const apiRequest = async <TData>(
+  cacheName: string,
+  payload: TData | FormData | null,
+  { url, method, headers = {}, mode = "cors", credentials = "include" }: WorkerApiRequest,
+  requestId?: string | null,
+  hookId?: string | null,
+): Promise<void> => {
+  const controller = new AbortController();
+  if (requestId) {
+    inFlightControllers.set(requestId, controller);
+  }
+
+  const fetchOptions: RequestInit = {
+    method,
+    mode,
+    credentials,
+    signal: controller.signal,
+  };
+
+  if (method.toUpperCase() !== "GET" && payload != null) {
+    const { body, headers: processedHeaders } = prepareRequestBody(payload, headers);
+    fetchOptions.body = body;
+    fetchOptions.headers = processedHeaders;
+  } else {
+    fetchOptions.headers = omitContentType(headers);
+  }
+
+  try {
+    const response = await fetch(url, fetchOptions);
+
+    if (!response.ok) {
+      callerResponse(cacheName, { error: response.statusText, code: response.status }, hookId);
+      return;
+    }
+
+    const responseData = await parseResponseByContentType(response);
+
+    if (isBinaryResponse(responseData)) {
+      callerResponseBinary(
+        cacheName,
+        responseData.data,
+        {
+          contentType: responseData.contentType,
+          contentDisposition: responseData.contentDisposition ?? null,
         },
-      };
-      store[stringifiedCacheName] = subject;
+        hookId,
+      );
+    } else {
+      commit(cacheName, responseData, hookId);
     }
-
-    return subject;
-  }
-
-  private addFileBlobToForm = (form: FormData, file: File | Blob, key: string) => {
-    if (file instanceof File || file instanceof Blob) {
-      //If it's a file, just use the existing name associated with it.  If it's a blob, use the key
-      form.append(file instanceof File ? file.name : key, file);
+  } catch (error) {
+    if ((error as Error).name === "AbortError") {
+      return;
     }
-    return form;
-  };
-
-  private traverseAndRemoveFiles = (obj: NestedRecord, form: FormData, namespace: string = ""): NestedRecord => {
-    for (const property in obj) {
-      if (obj.hasOwnProperty(property)) {
-        const formKey = namespace ? `${namespace}[${property}]` : property;
-        const value = obj[property];
-
-        if (value instanceof FileList) {
-          let i = 0;
-          const len = value.length;
-          while (i < len) {
-            const file = value[i];
-            this.addFileBlobToForm(form, file, file.name);
-            i++;
-          }
-          delete obj[property];
-        } else if (value instanceof File || value instanceof Blob) {
-          this.addFileBlobToForm(form, value, formKey);
-          delete obj[property];
-        } else if (value instanceof Date) {
-          obj[property] = value.toISOString();
-        } else if (value !== null && typeof value === "object" && !Array.isArray(value) && !(value instanceof Date)) {
-          obj[property] = this.traverseAndRemoveFiles(value as NestedRecord, form, formKey);
-        } else if (Array.isArray(value)) {
-          obj[property] = value
-            .map((element, index) => {
-              if (element instanceof File || element instanceof Blob) {
-                this.addFileBlobToForm(form, element, `${formKey}[${index}]`);
-                return null; // Return null to indicate removal
-              } else {
-                return this.traverseAndRemoveFiles(element as NestedRecord, form, `${formKey}[${index}]`);
-              }
-            })
-            .filter((element) => element !== null); // Remove null elements
-        }
-      }
-    }
-    return obj;
-  };
-
-  private convertToFormData = (
-    obj: NestedRecord,
-    form: FormData = new FormData(),
-    namespace: string = "",
-  ): FormData => {
-    const cleanedObj = this.traverseAndRemoveFiles(obj, form, namespace);
-    form.append("data", JSON.stringify(cleanedObj));
-    return form;
-  };
-
-  // private convertToFormData = (
-  //   obj: NestedRecord,
-  //   form: FormData = new FormData(),
-  //   namespace: string = "",
-  // ): FormData => {
-  //   for (const property in obj) {
-  //     // eslint-disable-next-line
-  //     if (obj.hasOwnProperty(property)) {
-  //       const formKey = namespace ? `${namespace}[${property}]` : property;
-  //       const value = obj[property];
-
-  //       if (value instanceof FileList) {
-  //         let i = 0;
-  //         const len = value.length;
-  //         while (i < len) {
-  //           const file = value[i];
-  //           form.append(file.name, file);
-  //           i++;
-  //         }
-  //       } else if (value instanceof File || value instanceof Blob) {
-  //         //If it's a file, just use the existing name associated with it.  If it's a blob, use the formKey
-  //         this.addFileBlobToForm(form, value, formKey);
-  //       } else if (value instanceof Date) {
-  //         form.append(formKey, value.toISOString()); // Convert Date to ISO 8601 string
-  //       } else if (value !== null && typeof value === "object" && !Array.isArray(value) && !(value instanceof Date)) {
-  //         //It's an object, make a recursive call
-  //         this.convertToFormData(value as NestedRecord, form, formKey);
-  //       } else if (Array.isArray(value)) {
-  //         // Process the array
-  //         let index = 0;
-  //         while (index < value.length) {
-  //           const element = value[index];
-  //           const tempKey = `${formKey}[${index}]`;
-  //           // Handle File or Blob types directly
-  //           if (element instanceof File || element instanceof Blob) {
-  //             this.addFileBlobToForm(form, element, tempKey);
-  //           } else {
-  //             // Otherwise, recursively process the element
-  //             this.convertToFormData(element as NestedRecord, form, tempKey);
-  //           }
-  //           index++;
-  //         }
-  //       } else {
-  //         form.append(formKey, String(value)); // Convert primitive types to string
-  //       }
-  //     }
-  //   }
-
-  //   return form;
-  // };
-
-  private requestAndUpdateStore(config: WorkerConfig, unsubscribe: () => void) {
-    const { url, method, body, headers, credentials, mode, cacheName, mergeExisting = false } = config;
-
-    const stringifiedCacheName = cacheName.toString().toLocaleLowerCase();
-    const subject = this.initializeStoreWithCacheName(stringifiedCacheName);
-    if (url && method) {
-      //Determine if this is a request for a fileupload or not
-      const isFileUpload = checkProperties(body);
-
-      const mergedHeaders = {
-        ...(headers && headers),
-        "Content-Type": isFileUpload ? "multipart/form-data" : "application/json",
-      };
-
-      fetch(url, {
-        method: method.toUpperCase(),
-        headers: mergedHeaders,
-        body: isFileUpload ? this.convertToFormData(body as NestedRecord) : JSON.stringify(body),
-        credentials,
-        mode,
-      })
-        .then((response) => {
-          // Check if the response is successful (status code 200-299)
-          if (!response.ok) {
-            throw new Error(`HTTP error! Status: ${response.status}`);
-          }
-          // Parse the response as JSON
-          return response.json();
-        })
-        .then((responseData) => {
-          if (!this.isEqual(responseData, subject.value)) {
-            const data = this.merge(subject.value, responseData, mergeExisting);
-            if (data) this.polling(subject, data);
-          } else {
-            unsubscribe();
-          }
-        })
-        .catch((error: unknown) => {
-          unsubscribe();
-          postMessage({
-            cacheName: stringifiedCacheName,
-            error: (error as Error).message,
-          });
-          this.destroy();
-        });
+    const err = error as Error;
+    const code = err.name === "TypeError" ? "NETWORK_ERROR" : "UNKNOWN";
+    callerResponse(cacheName, { error: err.message, code }, hookId);
+  } finally {
+    if (requestId) {
+      inFlightControllers.delete(requestId);
     }
   }
+};
 
-  private isEqual(a: unknown, b: unknown): boolean {
-    if (typeof a !== typeof b) {
-      return false; // Types are different
-    }
-
-    if (typeof a !== "object" || a === null) {
-      return a === b; // For non-object types, perform simple comparison
-    }
-
-    if (Array.isArray(a) && Array.isArray(b)) {
-      if (a.length !== b.length) {
-        return false; // Arrays have different lengths
-      }
-      let i = 0;
-      while (i < a.length) {
-        if (!this.isEqual(a[i], b[i])) {
-          return false; // Array elements are different
-        }
-        i += 1;
-      }
-
-      return true; // All array elements are equal
-    }
-
-    if (Array.isArray(a) || Array.isArray(b)) {
-      return false; // One is an array and the other is not, they can't be equal
-    }
-
-    const objA = a as Record<string | number, unknown>;
-    const objB = b as Record<string | number, unknown>;
-
-    const keysA = Object.keys(objA);
-    const keysB = Object.keys(objB);
-
-    if (keysA.length !== keysB.length) {
-      return false; // Objects have different number of keys
-    }
-
-    let j = 0;
-    while (j < keysA.length) {
-      const key = keysA[j];
-      if (!keysB.includes(key) || !this.isEqual(objA[key], objB[key])) {
-        return false; // Keys are different or their values are not equal
-      }
-      j += 1;
-    }
-
-    return true; // All keys and their values are equal
+const onRequest = <TData>(dataRequest: DataRequest<TData>): void => {
+  if (!dataRequest?.type) {
+    callerResponse(
+      "error",
+      { error: "Invalid request: type is required", code: "INVALID_REQUEST" },
+      dataRequest?.hookId,
+    );
+    return;
   }
-  private isObject = (value: unknown): value is Record<string, unknown> =>
-    typeof value === "object" && value !== null && !Array.isArray(value);
+  const { cacheName, type, payload, request, requestId, hookId } = dataRequest;
+  const lowerType = normalizeKey(type);
 
-  private destroy() {
-    this.unsubscribe();
-    delete classQueue[this.config.cacheName.toString().toLocaleLowerCase()];
+  if (lowerType === "cancel") {
+    if (requestId) onCancel(requestId);
+    return;
   }
-}
 
-onmessage = ({ data: { dataRequest } }: MessageEvent) => {
-  //Use structured clone to trigger a new context and avoid collisions when multiple calls to the worker occur
-  new ApiRequest(structuredClone(dataRequest));
+  if (!cacheName) {
+    callerResponse("error", { error: "Invalid request: cacheName is required", code: "INVALID_REQUEST" }, hookId);
+    return;
+  }
+  const lowerCacheName = normalizeKey(cacheName);
+
+  if (lowerType === "get") {
+    const requestedData = get(lowerCacheName);
+    if (requestedData === undefined) {
+      callerResponse(lowerCacheName, { error: "Cache miss", code: "CACHE_MISS" }, hookId);
+    } else {
+      callerResponse(lowerCacheName, requestedData, hookId);
+    }
+  } else if (lowerType === "set") {
+    if (!request) {
+      set(lowerCacheName, payload);
+    } else {
+      apiRequest(lowerCacheName, payload ?? null, request, requestId, hookId);
+    }
+  } else if (lowerType === "delete") {
+    remove(lowerCacheName);
+    callerResponse(lowerCacheName, { deleted: true }, hookId);
+  }
+};
+
+const onCancel = (requestId: string): void => {
+  const controller = inFlightControllers.get(requestId);
+  if (controller) {
+    controller.abort();
+    inFlightControllers.delete(requestId);
+  }
+};
+
+onmessage = ({ data }: MessageEvent) => {
+  const dataRequest = data?.dataRequest;
+  if (dataRequest) {
+    onRequest(dataRequest);
+  }
 };

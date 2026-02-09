@@ -1,22 +1,36 @@
 {
-  "include": ["src"],
   "exclude": ["dist", "node_modules"],
+  "include": ["src"],
   "compilerOptions": {
-    "module": "ESNEXT",
-    "lib": ["dom", "esnext"],
+    // ESM-only library build
     "declaration": true,
-    "sourceMap": true,
-    "rootDir": "./src",
-    "outDir": "./dist/esm",
-    "strict": true,
-    "noImplicitReturns": true,
+    "declarationDir": "./dist",
+    "emitDeclarationOnly": true,
+    "esModuleInterop": true,
+
+    // Interop & correctness
+    "forceConsistentCasingInFileNames": true,
+
+    // React JSX transform
+    "jsx": "react-jsx",
+
+    // Target & libs
+    "lib": ["dom", "esnext"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+
+    // Strictness
     "noFallthroughCasesInSwitch": true,
+    "noImplicitReturns": true,
     "noUnusedLocals": true,
     "noUnusedParameters": true,
-    "moduleResolution": "node",
-    "jsx": "react-jsx",
-    "esModuleInterop": true,
+
+    // Emit locations
+    "outDir": "./dist",
+    "rootDir": "./src",
     "skipLibCheck": true,
-    "forceConsistentCasingInFileNames": true
+    "sourceMap": true,
+    "strict": true,
+    "target": "esnext"
   }
 }

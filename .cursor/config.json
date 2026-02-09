@@ -1,0 +1,7 @@
+{
+  "agent": {
+    "verbosity": "minimal",
+    "explain": false,
+    "planning": false
+  }
+}

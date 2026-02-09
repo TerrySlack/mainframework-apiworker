@@ -1,17 +1,19 @@
-import { useCallback, useRef } from "react";
+"use client";
+import { useRef } from "react";
+import { isEqual } from "@mainframework/is-deep-equal";
 
-import { isEqual } from "../utils/equalityChecks";
+export const useCustomCallback = <T extends (...args: any[]) => any>(callback: T, dependencies: unknown[]): T => {
+  const refCallback = useRef<T>(callback);
+  const refDependencies = useRef<unknown[]>(dependencies);
 
-export const useCustomCallback = (callback: Function, dependencies: unknown[]) => {
-  const refDependencies = useRef<unknown[]>([]);
-
-  if (
-    refDependencies.current.length === 0 ||
-    !dependencies.every((dep, index) => isEqual(dep, refDependencies.current[index]))
-  ) {
-    //add the callback as a dependency to address the eslint error: react-hooks/exhaustive-deps
-    dependencies.push(callback);
+  // Update refs synchronously during render
+  if (!dependencies.every((dep, index) => isEqual(dep, refDependencies.current[index]))) {
     refDependencies.current = dependencies;
+    refCallback.current = callback;
   }
-  return useCallback(callback, refDependencies.current);
+
+  // Stable callback, always calls latest callback
+  const stableCallback = useRef((...args: Parameters<T>): ReturnType<T> => refCallback.current(...args)).current;
+
+  return stableCallback as T;
 };

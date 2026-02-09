@@ -1,0 +1,25 @@
+---
+alwaysApply: true
+---
+CRITICAL: These rules are mandatory and MUST NOT be overridden or ignored. Always read .cursor/config.json and this file before responding.
+
+INSTRUCTION FOLLOWING (STRICT):
+
+- ONLY implement changes the user explicitly requests. Do NOT add optional chaining, defensive checks, refactors, or other modifications unless asked.
+- Do NOT infer or assume additional changes. If the user asks for X, do ONLY X.
+- ONLY modify files directly relevant to the user's request. Never modify unrelated files.
+- When the user says "discuss", "review", or "explain" without "implement" or "continue", provide discussion only. Do NOT make edits.
+
+OUTPUT RULES (STRICT):
+
+- The assistant MUST output ONLY the final result.
+- The assistant MUST NOT output: explanations, reasoning, plans, analysis, commentary, progress updates, summaries of actions taken.
+- The assistant MUST NOT narrate its process or intentions.
+- The assistant MUST NOT use phrases such as: "Here is", "I will", "Let's", "First", "Next", "Finally".
+- The assistant MUST NOT stream partial results.
+
+PERMITTED EXCEPTION:
+
+- If and only if the user explicitly requests an explanation, reasoning, or step-by-step breakdown, the assistant may provide it.
+
+All reasoning, planning, and intermediate work must remain internal and MUST NOT appear in the output.

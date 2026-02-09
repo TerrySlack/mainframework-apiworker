@@ -1,100 +1,192 @@
-import { Dispatch, SetStateAction, useRef, useState } from "react";
-import { isEqual } from "../utils/equalityChecks";
-import { useTaskQueue } from "../providers/ApiWorkerProvider";
-import { QueryConfig } from "../types/types";
+// useApiWorker.ts
+import { useRef, useState, useCallback, useEffect } from "react";
+import { uniqueId } from "../utils/uniqueId";
+import type {
+  DataRequest,
+  QueueEntry,
+  RequestConfig,
+  UseApiWorkerConfig,
+  UseApiWorkerReturn,
+  WorkerApiRequest,
+} from "../types/types";
 import { useCustomCallback } from "./useCustomCallback";
 
-export const useApiWorker = <T>(
-  apiQueryConfig: QueryConfig,
-): [T | undefined, () => T extends Promise<unknown> ? T : void] => {
-  const { addToQueue } = useTaskQueue();
-  const [, setData] = useState<number>(0);
+// ============================================================================
+// MODULE-LEVEL WORKER & QUEUE
+// ============================================================================
 
-  const lastRequestRequestDate = useRef<Date>(new Date());
-  const runOnceRef = useRef<boolean>(false);
+const apiWorker = new Worker(new URL("../workers/api/api.worker", import.meta.url));
 
-  const dataRef = useRef<unknown>(); //Let's ensure referential integrity
-  const callBackRef = useRef<(data: unknown) => void>((data: unknown) => {
-    dataRef.current = data;
-    setData((state: number) => (state += 1));
-  });
-  const ApiConfigRef = useRef<QueryConfig | undefined>(undefined);
+const STALE_ENTRY_MS = 5000;
+const CLEANUP_INTERVAL_MS = 30000;
 
-  //Compare when files are added, if the same config is sent in?
-  if (!isEqual(ApiConfigRef.current, apiQueryConfig)) ApiConfigRef.current = apiQueryConfig; //Keep a ref so that the method makeRequest below, will have the latest config data
+const normalizeKey = (key: string) => key.toLowerCase();
 
-  const makeRequest = useCustomCallback(
-    (
-      /*
-        Resolve is passed in when a user has selected to have a promise returend, instead of a function to make a request.
-        Resolve, will return the data from the api call to the calling function.
-      */
-      resolve?: (data: Dispatch<SetStateAction<undefined>> | unknown) => void,
-    ) => {
-      if (ApiConfigRef?.current?.queryConfig) {
-        //If it's runonce, and the runOnceRef is true, then dont' call the worker, and re-used the data in the hook
-        const runOnce = Boolean(ApiConfigRef.current.queryConfig.runOnce);
+const cleanupState = { isDeleting: false, lastRun: 0 };
 
-        if (runOnceRef.current && runOnce) return;
-        else {
-          //Let's set runOnceRef to true, but continue processing
-          runOnceRef.current = runOnce;
-        }
+const runStaleEntryCleanup = (): void => {
+  const now = Date.now();
+  if (cleanupState.isDeleting || now < cleanupState.lastRun + CLEANUP_INTERVAL_MS) return;
+  cleanupState.isDeleting = true;
+  try {
+    for (const key of Object.keys(responseQueue)) {
+      const entry = responseQueue[key];
+      if (!entry) continue;
 
-        //Compare the current time, with the last time.  If it's >= 2000 ms, then addToQueue, otherwise, it's a re-render and re-use the current data
-        const currentDate = new Date();
-
-        /*
-      Is it because it's been less than 5 secconds that the worker isn't called again?
-    */
-        if (
-          !dataRef.current ||
-          //If makeRequest is called repeatedly, from re-rendering, we can avoid it by only making calls if it's been 2 seconds, since the last call.
-          currentDate.getTime() - lastRequestRequestDate.current.getTime() >= 5000
-        ) {
-          //Update lastRequestRequestDate
-          lastRequestRequestDate.current = new Date();
-          //If reset is true, then we don't want to pass a callback.
-          const callback = ApiConfigRef.current.queryConfig.reset ? undefined : resolve ? resolve : callBackRef.current;
-
-          addToQueue(
-            ApiConfigRef.current.queryConfig,
-            ApiConfigRef.current.requestConfig,
-            callback, // resolve ? resolve : callBackRef.current,
-          );
-
-          if (!callback && Boolean(dataRef.current)) {
-            //If a callback isn't passed and there is currently data in dataRef.current, then reset the data and trigger a re-render
-            //reset the data here.  callback will be undefined
-            dataRef.current = undefined;
-            //Trigger an update
-            setData(0);
-          }
-        }
-
-        if (
-          ApiConfigRef.current.queryConfig &&
-          typeof ApiConfigRef.current.queryConfig?.run !== "undefined" &&
-          !ApiConfigRef.current.queryConfig?.run
-        )
-          return;
+      if (entry.data != null && entry.lastActivityAt != null && now - entry.lastActivityAt >= STALE_ENTRY_MS) {
+        entry.loading = null;
+        entry.data = null;
+        entry.meta = null;
+        entry.error = null;
+        entry.setUpdateTrigger = null;
+        entry.requestId = null;
       }
-    },
-    [ApiConfigRef.current, apiQueryConfig],
-  );
+    }
+  } finally {
+    cleanupState.isDeleting = false;
+    cleanupState.lastRun = now;
+  }
+};
 
-  const request = ApiConfigRef?.current?.returnPromise
-    ? () =>
-        new Promise((resolve) => {
-          makeRequest(resolve); //Pass resolve to replace the use of setData, in order to have data returned from the promise
-        })
-    : makeRequest;
+const responseQueue: Record<string, QueueEntry<unknown>> = {};
 
-  //If there is no request object it could be a request for data from the cache.  If runAuto is used, it means the app is not using the lazy function
-  if (!ApiConfigRef?.current?.requestConfig || ApiConfigRef?.current?.queryConfig?.runAuto) {
-    //Fire off request if requestObject is undefined
-    request();
+const updater = (n: number) => n + 1;
+
+const toWorkerRequest = (requestConfig: RequestConfig): WorkerApiRequest => ({
+  url: requestConfig.url,
+  method: requestConfig.method,
+  mode: requestConfig.mode,
+  headers: requestConfig.headers,
+  credentials: requestConfig.credentials,
+});
+
+// Worker message handler
+apiWorker.onmessage = (event: MessageEvent) => {
+  const { data, cacheName, meta } = event.data;
+  const errorPayload = event.data.error ?? event.data.data?.error;
+  const errorCode = event.data.data?.code;
+
+  if (!cacheName) return;
+  const entry = responseQueue[normalizeKey(cacheName)];
+  if (!entry) return;
+  if (cacheName !== "error" && normalizeKey(entry.cacheName) !== normalizeKey(cacheName)) return;
+
+  if (errorPayload) {
+    entry.error = {
+      message: typeof errorPayload === "string" ? errorPayload : String(errorPayload),
+      code: errorCode,
+    };
+    entry.loading = false;
+  } else {
+    entry.data = data;
+    entry.meta = meta ?? null;
+    entry.lastActivityAt = Date.now();
+    entry.error = null;
+    entry.loading = false;
+  }
+  entry.requestId = null;
+  entry.setUpdateTrigger?.(updater);
+};
+
+// ============================================================================
+// HOOK
+// ============================================================================
+
+export type { UseApiWorkerReturn } from "../types/types";
+
+export const useApiWorker = <T>(config: UseApiWorkerConfig): UseApiWorkerReturn<T> => {
+  const { cacheName, request: requestConfig, data: configData, runMode = "auto", enabled = true } = config;
+
+  const hookIdRef = useRef<string>("");
+  const queueKey = normalizeKey(cacheName);
+
+  const hasExecutedRef = useRef(false);
+  const [, setUpdateTrigger] = useState(0);
+
+  let storeEntry = responseQueue[queueKey];
+
+  if (!storeEntry) {
+    const hookId = uniqueId();
+    responseQueue[queueKey] = {
+      hookId,
+      cacheName,
+      data: null,
+      loading: false,
+      error: null,
+      setUpdateTrigger: () => {},
+      requestId: null,
+      meta: null,
+      lastActivityAt: null,
+    };
+    storeEntry = responseQueue[queueKey];
+    hookIdRef.current = hookId;
+  } else {
+    hookIdRef.current = storeEntry.hookId;
+    storeEntry.lastActivityAt = Date.now();
+  }
+  storeEntry.setUpdateTrigger = setUpdateTrigger;
+
+  const hookId = hookIdRef.current;
+
+  const deleteCache = useCallback(() => {
+    if (cacheName) {
+      apiWorker.postMessage({
+        dataRequest: { type: "delete", cacheName, hookId },
+      });
+    }
+  }, [cacheName, hookId]);
+
+  useEffect(() => {
+    runStaleEntryCleanup();
+  });
+
+  const makeRequest = useCustomCallback(() => {
+    if (!enabled || (runMode === "once" && hasExecutedRef.current)) return;
+    const entry = responseQueue[queueKey];
+    if (!entry || entry.loading) return;
+    const requestId = uniqueId();
+    entry.requestId = requestId;
+    entry.loading = true;
+    entry.error = null;
+    entry.lastActivityAt = Date.now();
+    entry.setUpdateTrigger?.(updater);
+
+    const dataRequest: DataRequest<unknown> = requestConfig
+      ? {
+          type: "set",
+          cacheName,
+          hookId,
+          requestId,
+          payload: configData ?? requestConfig.body,
+          request: toWorkerRequest(requestConfig),
+        }
+      : { type: "get", cacheName, hookId };
+
+    apiWorker.postMessage({ dataRequest });
+    hasExecutedRef.current = true;
+  }, [hookId, queueKey, cacheName, requestConfig, configData, runMode, enabled, setUpdateTrigger]);
+
+  const shouldRun = (runMode === "auto" || runMode === "once") && enabled && (requestConfig || cacheName);
+  if (shouldRun && !(runMode === "once" && hasExecutedRef.current) && !storeEntry.loading) {
+    const now = Date.now();
+    if (requestConfig) {
+      makeRequest();
+    } else {
+      storeEntry.loading = true;
+      storeEntry.error = null;
+      storeEntry.lastActivityAt = now;
+      if (runMode === "once") hasExecutedRef.current = true;
+      setUpdateTrigger(updater);
+      apiWorker.postMessage({ dataRequest: { type: "get", cacheName, hookId } as DataRequest<unknown> });
+    }
   }
 
-  return [dataRef.current as T, request as () => T extends Promise<unknown> ? T : void];
+  return {
+    data: (storeEntry?.data as T) ?? null,
+    meta: storeEntry?.meta ?? null,
+    loading: storeEntry?.loading ?? false,
+    error: storeEntry?.error ?? null,
+    refetch: makeRequest,
+    deleteCache,
+  };
 };

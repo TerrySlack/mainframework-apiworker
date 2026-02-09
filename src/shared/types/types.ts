@@ -1,75 +1,147 @@
-import { Dispatch, SetStateAction, ReactNode } from "react";
+import { Dispatch, SetStateAction } from "react";
 
-export interface Config {
-  cacheName: string | number;
-  data?: unknown;
-  mergeExisting?: boolean;
-  run?: boolean;
-  runOnce?: boolean; //Only run the query once Remove the task from the queue as I'm doing now.
-  runAuto?: boolean; //Run the query, without having to use the returned function
-  reset?: Reset;
-}
-
-export type ConfigWithId = Config & {
-  id?: string;
-};
 export interface RequestConfig {
   url: string;
   method: "GET" | "get" | "POST" | "post" | "PATCH" | "patch" | "DELETE" | "delete";
-  mode?: "cors" | "no-cors" | undefined;
+  mode?: "cors" | "no-cors" | "navigate" | "same-origin";
   body?: unknown;
-  headers?: object;
-  credentials?: "include" | "same-origin" | "omit" | undefined;
+  headers?: Record<string, string>;
+  credentials?: "include" | "same-origin" | "omit";
 }
 
-export interface QueryConfig {
-  requestConfig?: RequestConfig;
-  queryConfig: ConfigWithId;
-  returnPromise?: boolean;
-}
-export type WorkerConfig = RequestConfig &
-  Omit<ConfigWithId, "runAuto"> & {
-    id?: string;
-  };
+export type RunMode = "auto" | "manual" | "once";
 
-export interface QueueContextType {
-  addToQueue: (
-    config: ConfigWithId,
-    requestQueryConfig?: RequestConfig,
-    callback?: (data: Dispatch<SetStateAction<undefined>> | unknown) => void,
-  ) => void;
-}
-
-export interface WorkerProvider {
-  children: ReactNode;
-}
-// Define types for task and task queue
-export interface Task {
-  callback: (data: unknown) => void;
-}
-
-export interface TaskQueue {
-  [id: string | number]: Task;
-}
-
-export interface StoreSubject {
-  name: string | number;
-  lock: boolean;
-  value: unknown;
-  subscribers: ((data: unknown) => void)[];
-  next: (value: unknown) => void;
-  subscribe: (subscriber: (data: unknown) => void) => () => void;
-}
-
-export interface StoreSubjects {
-  [cacheName: string | number]: StoreSubject;
-}
-
-export interface ResetConfig {
+export interface UseApiWorkerConfig {
   cacheName: string;
-  placeHolderData: unknown;
+  request?: RequestConfig;
+  data?: unknown;
+  runMode?: RunMode;
+  enabled?: boolean;
 }
 
-export type Queue<T> = Record<string, T>;
+export type WorkerDataRequestType = "get" | "set" | "delete" | "cancel";
 
-export type Reset = string | ResetConfig;
+export type WorkerApiRequest = Omit<RequestConfig, "body">;
+
+export interface DataRequest<T = unknown> {
+  hookId?: string;
+  cacheName?: string;
+  type: WorkerDataRequestType;
+  payload?: T;
+  request?: WorkerApiRequest;
+  /** Required for cancel, optional for set (enables cancellation). */
+  requestId?: string | null;
+}
+
+export interface BinaryResponseMeta {
+  contentType?: string;
+  contentDisposition: string | null;
+}
+
+export type BinaryParseResult = {
+  __binary: true;
+  data: ArrayBuffer;
+  contentType: string;
+} & Pick<BinaryResponseMeta, "contentDisposition">;
+
+export interface WorkerError {
+  message: string;
+  code?: string | number;
+}
+
+export interface QueueEntry<T> {
+  hookId: string;
+  cacheName: string;
+  loading: boolean | null;
+  data: T | null;
+  meta: BinaryResponseMeta | null;
+  error: WorkerError | null;
+  setUpdateTrigger: Dispatch<SetStateAction<number>> | null;
+  requestId: string | null;
+  lastActivityAt: number | null;
+}
+
+export interface UseApiWorkerReturn<T> {
+  data: T | null;
+  meta: BinaryResponseMeta | null;
+  loading: boolean;
+  error: WorkerError | null;
+  refetch: () => void;
+  deleteCache: () => void;
+}
+
+export type AbortControllers = Map<string, AbortController>;
+
+/**
+ * Worker response messages. Use in client onmessage handler:
+ * - data + meta: binary response (data is ArrayBuffer). Reconstruct: new Blob([data], { type: meta?.contentType })
+ * - data only: JSON/text response
+ * - error: error response with message and code
+ */
+export type WorkerResponseMessage =
+  | { cacheName: string; data: unknown }
+  | { cacheName: string; data: ArrayBuffer; meta: BinaryResponseMeta }
+  | { cacheName: string; error: WorkerError };
+
+export interface StackArray {
+  key: string;
+  value: unknown;
+}
+
+//Use this in the hook to show the engineer what kind of content type to use
+export type ContentType =
+  // Application types
+  | "application/json"
+  | "application/xml"
+  | "application/x-www-form-urlencoded"
+  | "application/pdf"
+  | "application/zip"
+  | "application/gzip"
+  | "application/octet-stream"
+  | "application/javascript"
+  | "application/ld+json"
+  | "application/vnd.api+json"
+  | "application/vnd.ms-excel"
+  | "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+  | "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+  | "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+  // Text types
+  | "text/plain"
+  | "text/html"
+  | "text/css"
+  | "text/csv"
+  | "text/javascript"
+  | "text/xml"
+  // Image types
+  | "image/jpeg"
+  | "image/png"
+  | "image/gif"
+  | "image/svg+xml"
+  | "image/webp"
+  | "image/bmp"
+  | "image/tiff"
+  | "image/x-icon"
+  | "image/avif"
+  // Audio types
+  | "audio/mpeg"
+  | "audio/ogg"
+  | "audio/wav"
+  | "audio/webm"
+  | "audio/aac"
+  | "audio/midi"
+  // Video types
+  | "video/mp4"
+  | "video/mpeg"
+  | "video/webm"
+  | "video/ogg"
+  | "video/quicktime"
+  | "video/x-msvideo"
+  // Multipart types
+  | "multipart/form-data"
+  | "multipart/mixed"
+  | "multipart/alternative"
+  // Font types
+  | "font/woff"
+  | "font/woff2"
+  | "font/ttf"
+  | "font/otf";
