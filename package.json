@@ -21,7 +21,9 @@
   },
   "homepage": "https://github.com/TerrySlack/mainframework-api-hook-provider-worker#readme",
   "scripts": {
+    "husky-setup": "npx husky init",
     "husky": "husky",
+    "prepare": "husky",
     "clean": "rimraf dist",
     "lint": "eslint --ext 'ts,tsx' --max-warnings=0 --fix",
     "lint-staged": "lint-staged",
@@ -29,6 +31,14 @@
     "build": "yarn prebuild && yarn build:esm",
     "build:esm": "tsc",
     "test": "jest --config jestconfig.json"
+  },
+  "lint-staged": {
+    "*.{js,jsx,ts,tsx}": [
+      "eslint --max-warnings=0"
+    ],
+    "*.{js,jsx,ts,tsx,json,css,md}": [
+      "prettier --write"
+    ]
   },
   "peerDependencies": {
     "react": ">=19"
@@ -51,23 +61,12 @@
   ],
   "author": "Terry Slack",
   "license": "MIT",
-  "husky": {
-    "hooks": {
-      "pre-commit": "npm run lint-staged && git add --all"
-    }
-  },
-  "lint-staged": {
-    "*.(ts|tsx)": [
-      "eslint --fix",
-      "prettier --write"
-    ]
-  },
   "devDependencies": {
     "@mainframework/is-deep-equal": "^1.0.9",
     "@testing-library/react": "^16.3.2",
     "@types/jest": "^30.0.0",
     "@types/react": "^19.2.13",
-    "eslint": "^9.39.2",
+    "eslint": "^10.0.0",
     "eslint-config-prettier": "^10.1.8",
     "eslint-plugin-react": "^7.37.5",
     "eslint-plugin-react-hooks": "^7.0.1",
