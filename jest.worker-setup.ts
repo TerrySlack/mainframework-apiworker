@@ -2,7 +2,12 @@
  * Mocks global Worker so useApiWorker tests can run without a real worker.
  * Tests can simulate worker responses via __WORKER_MOCK__.dispatchMessage(payload).
  */
-const mockPostMessage = jest.fn<typeof Worker.prototype.postMessage>();
+import nodeFetch from "node-fetch";
+
+const mockPostMessage = jest.fn<
+  ReturnType<typeof Worker.prototype.postMessage>,
+  Parameters<typeof Worker.prototype.postMessage>
+>();
 let onmessageHandler: ((e: MessageEvent) => void) | null = null;
 
 const mockWorkerInstance = {
@@ -39,3 +44,22 @@ const workerMock = {
 
 (globalThis as unknown as { Worker: typeof Worker }).Worker = MockWorker as unknown as typeof Worker;
 (globalThis as unknown as { __WORKER_MOCK__: typeof workerMock }).__WORKER_MOCK__ = workerMock;
+
+// Ensure global fetch is available for all tests
+interface GlobalWithFetch {
+  fetch?: typeof fetch;
+}
+
+if (typeof (globalThis as GlobalWithFetch).fetch !== "function") {
+  (globalThis as GlobalWithFetch).fetch = nodeFetch as unknown as typeof fetch;
+}
+
+const g = globalThis as GlobalWithFetch & { __FETCH_IS_STUB__?: boolean };
+const proc =
+  typeof process !== "undefined" ? (process as NodeJS.Process & { __JEST_REAL_FETCH__?: typeof fetch }) : undefined;
+if (proc?.__JEST_REAL_FETCH__) {
+  g.fetch = proc.__JEST_REAL_FETCH__;
+  g.__FETCH_IS_STUB__ = false;
+} else {
+  g.__FETCH_IS_STUB__ = true;
+}

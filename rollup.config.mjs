@@ -19,6 +19,8 @@ export default {
       values: {
         // Point the built main bundle at the emitted worker file in dist
         "../workers/api/api.worker": "./api.worker.js",
+        // Strip "use client" - module level directives cause errors when bundled
+        '"use client";': "",
       },
     }),
     resolve(),

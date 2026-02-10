@@ -51,11 +51,25 @@ const responseQueue: Record<string, QueueEntry<unknown>> = {};
 
 const updater = (n: number) => n + 1;
 
+const ERROR_KINDS = ["http", "network", "validation"] as const;
+const isWorkerErrorPayload = (d: unknown): d is { kind: string; message: string; status?: number; code?: string } =>
+  !!d &&
+  typeof d === "object" &&
+  "kind" in d &&
+  typeof (d as { kind: unknown }).kind === "string" &&
+  ERROR_KINDS.includes((d as { kind: string }).kind as (typeof ERROR_KINDS)[number]) &&
+  "message" in d &&
+  typeof (d as { message: unknown }).message === "string";
+
 // Worker message handler
 apiWorker.onmessage = (event: MessageEvent<WorkerMessagePayload>) => {
   const { data, cacheName, meta } = event.data;
-  const errorPayload = event.data.error ?? event.data.data?.error;
-  const errorCode = event.data.data?.code;
+  const errorPayload = isWorkerErrorPayload(event.data.data)
+    ? event.data.data
+    : (event.data.error ??
+      (event.data.data && typeof event.data.data === "object" && "error" in event.data.data
+        ? (event.data.data as { error: unknown }).error
+        : null));
 
   if (!cacheName) return;
   const entry = responseQueue[normalizeKey(cacheName)];
@@ -72,10 +86,20 @@ apiWorker.onmessage = (event: MessageEvent<WorkerMessagePayload>) => {
             typeof (errorPayload as { message: unknown }).message === "string"
           ? (errorPayload as { message: string }).message
           : "Unknown error";
-    entry.error = {
-      message,
-      code: errorCode,
-    };
+    entry.error = isWorkerErrorPayload(errorPayload)
+      ? {
+          kind: errorPayload.kind as "http" | "network" | "validation",
+          message,
+          ...(errorPayload.status !== undefined && { status: errorPayload.status }),
+          ...(errorPayload.code !== undefined && { code: errorPayload.code }),
+        }
+      : {
+          kind: "validation" as const,
+          message,
+          ...((event.data.data as { code?: string } | undefined)?.code !== undefined && {
+            code: (event.data.data as { code?: string }).code,
+          }),
+        };
     entry.loading = false;
   } else {
     entry.data = data;

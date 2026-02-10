@@ -7,13 +7,30 @@ import type {
   DataRequest,
   StackArray,
   WorkerApiRequest,
+  WorkerErrorKind,
 } from "../../types/types";
 
+export const BINARY_MARKER = Symbol.for("WorkerApiBinary");
+
+const CODE_CACHE_MISS = "CACHE_MISS";
+const CODE_INVALID_REQUEST = "INVALID_REQUEST";
+const CODE_NETWORK_ERROR = "NETWORK_ERROR";
+const CODE_UNKNOWN = "UNKNOWN";
+const DEFAULT_FILES_FIELD = "Files";
+
 const callerResponse = <T>(cacheName: string, data: T, hookId?: string | null, httpStatus?: number): void => {
-  if ((data !== undefined && data !== null) || httpStatus !== undefined) {
-    self.postMessage({ cacheName, data: data ?? null, hookId, httpStatus });
-  }
+  self.postMessage({ cacheName, data: data ?? null, hookId, httpStatus });
 };
+
+const makeError = (
+  kind: WorkerErrorKind,
+  message: string,
+  opts?: { status?: number; code?: string },
+): { kind: WorkerErrorKind; message: string; status?: number; code?: string } => ({
+  kind,
+  message,
+  ...opts,
+});
 
 /**
  * Binary response - transferred via postMessage, not stored in cache.
@@ -52,7 +69,11 @@ const omitContentType = (headers: Record<string, string>): Record<string, string
 };
 
 const isBinaryResponse = (r: unknown): r is BinaryParseResult =>
-  !!r && typeof r === "object" && "__binary" in r && (r as { __binary: unknown }).__binary === true;
+  !!r &&
+  typeof r === "object" &&
+  BINARY_MARKER in r &&
+  (r as Record<symbol, unknown>)[BINARY_MARKER] === true &&
+  (r as unknown as BinaryParseResult).data instanceof ArrayBuffer;
 
 const commit = <TData>(cacheName: string, data: TData, hookId?: string | null, httpStatus?: number): void => {
   if (cacheName) {
@@ -61,12 +82,16 @@ const commit = <TData>(cacheName: string, data: TData, hookId?: string | null, h
     return;
   }
 
-  callerResponse("error", { error: "Invalid commit: cacheName is required", code: "INVALID_REQUEST" }, hookId);
+  callerResponse(
+    "error",
+    makeError("validation", "Invalid commit: cacheName is required", { code: CODE_INVALID_REQUEST }),
+    hookId,
+  );
 };
 
 /**
  * Parses response based on content-type.
- * Returns parsed data for JSON/text, or { __binary, data, contentType, contentDisposition } for binary.
+ * Returns parsed data for JSON/text, or binary result with BINARY_MARKER, data (ArrayBuffer), contentType, contentDisposition.
  */
 const parseResponseByContentType = async (response: Response): Promise<unknown> => {
   const contentType = response.headers.get("content-type")?.toLocaleLowerCase() || "";
@@ -95,22 +120,26 @@ const parseResponseByContentType = async (response: Response): Promise<unknown> 
   // Binary types (known or fallback) - use arrayBuffer for zero-copy transfer to client
   const arrayBuffer = await response.arrayBuffer();
   return {
-    __binary: true as const,
+    [BINARY_MARKER]: true as const,
     data: arrayBuffer,
     contentType,
     contentDisposition: response.headers.get("content-disposition"),
   };
 };
 
-// Top-level helper
-const appendToFormData = (formData: FormData, key: string, value: unknown): void => {
+const appendToFormData = (
+  formData: FormData,
+  key: string,
+  value: unknown,
+  fileFieldName: string = DEFAULT_FILES_FIELD,
+): void => {
   if (value instanceof File) {
-    formData.append("Files", value, value.name);
+    formData.append(fileFieldName, value, value.name);
     return;
   }
 
   if (value instanceof Blob) {
-    formData.append("Files", value, "blob");
+    formData.append(fileFieldName, value, "blob");
     return;
   }
 
@@ -139,16 +168,17 @@ const pushObjectToStack = (
   }
 };
 
-const createFormDataIfBlobOrFile = (payload: unknown): FormData | null => {
+const createFormDataIfBlobOrFile = (payload: unknown, fileFieldName: string = DEFAULT_FILES_FIELD): FormData | null => {
   if (payload === null || payload === undefined || typeof payload !== "object") {
     return null;
   }
 
   const formData = new FormData();
   let hasFile = false;
-
+  const visited = new WeakSet<object>();
   const stack: StackArray[] = [];
 
+  visited.add(payload);
   if (Array.isArray(payload)) {
     let i = 0;
     while (i < payload.length) {
@@ -167,11 +197,13 @@ const createFormDataIfBlobOrFile = (payload: unknown): FormData | null => {
 
     if (value instanceof File || value instanceof Blob) {
       hasFile = true;
-      appendToFormData(formData, key, value);
+      appendToFormData(formData, key, value, fileFieldName);
       continue;
     }
 
     if (Array.isArray(value)) {
+      if (visited.has(value)) continue;
+      visited.add(value);
       let j = 0;
       while (j < value.length) {
         stack.push({ key: `${key}.${j}`, value: value[j] });
@@ -181,16 +213,18 @@ const createFormDataIfBlobOrFile = (payload: unknown): FormData | null => {
     }
 
     if (value !== null && typeof value === "object") {
+      if (visited.has(value)) continue;
+      visited.add(value);
       pushObjectToStack(value as Record<string, unknown>, key, stack);
       continue;
     }
 
-    appendToFormData(formData, key, value);
+    appendToFormData(formData, key, value, fileFieldName);
   }
 
   return hasFile ? formData : null;
 };
-//Extracts Content-Type from headers object Returns "application/json" if not found
+
 const getContentType = (headers: Record<string, string> = {}): string =>
   headers["Content-Type"] || headers["content-type"] || "application/json";
 
@@ -213,88 +247,68 @@ const getPayloadType = (payload: unknown): string => {
   }
 };
 
+const buildJsonBody = (payload: unknown): BodyInit => JSON.stringify(payload);
+const buildUrlEncodedBody = (payload: Record<string, string>): BodyInit => new URLSearchParams(payload).toString();
+const buildTextBody = (payload: unknown): BodyInit => String(payload);
+
 const prepareRequestBody = (
   payload: unknown,
   headers: Record<string, string>,
+  options?: { formDataFileFieldName?: string },
 ): { body?: BodyInit; headers: Record<string, string> } => {
   const payloadType = getPayloadType(payload);
+  const outHeaders = (): Record<string, string> => ({ ...headers });
 
   switch (payloadType) {
     case "formdata":
-      return {
-        body: payload as FormData,
-        headers: omitContentType(headers),
-      };
+      return { body: payload as FormData, headers: omitContentType(outHeaders()) };
 
     case "blob":
-      return {
-        body: payload as Blob,
-        headers,
-      };
+      return { body: payload as Blob, headers: outHeaders() };
 
     case "arraybuffer":
-      return {
-        body: payload as ArrayBuffer,
-        headers,
-      };
+      return { body: payload as ArrayBuffer, headers: outHeaders() };
 
     case "arraybufferview":
-      return {
-        body: payload as BodyInit,
-        headers,
-      };
+      return { body: payload as BodyInit, headers: outHeaders() };
 
     case "stream":
-      return {
-        body: payload as ReadableStream<Uint8Array>,
-        headers,
-      };
+      return { body: payload as ReadableStream<Uint8Array>, headers: outHeaders() };
 
     case "string":
-      return {
-        body: payload as string,
-        headers,
-      };
+      return { body: payload as string, headers: outHeaders() };
 
     case "object": {
-      const contentType = getContentType(headers);
+      const h = outHeaders();
+      const contentType = getContentType(h);
+      const fileFieldName = options?.formDataFileFieldName ?? DEFAULT_FILES_FIELD;
+
       let body: BodyInit;
-      let finalHeaders = headers;
-
       if (contentType.includes("application/json")) {
-        body = JSON.stringify(payload);
+        body = buildJsonBody(payload);
       } else if (contentType.includes("application/x-www-form-urlencoded")) {
-        body = new URLSearchParams(payload as Record<string, string>).toString();
+        body = buildUrlEncodedBody(payload as Record<string, string>);
       } else if (contentType.startsWith("text/") || contentType.includes("xml")) {
-        body = String(payload);
+        body = buildTextBody(payload);
       } else if (contentType.includes("multipart/form-data")) {
-        const formData = createFormDataIfBlobOrFile(payload);
+        const formData = createFormDataIfBlobOrFile(payload, fileFieldName);
         if (formData) {
-          body = formData;
-          finalHeaders = omitContentType(headers);
-        } else {
-          body = JSON.stringify(payload);
-          finalHeaders = {
-            ...headers,
-            "Content-Type": "application/json",
-          };
+          return { body: formData, headers: omitContentType(h) };
         }
+        body = buildJsonBody(payload);
+        h["Content-Type"] = "application/json";
       } else {
-        body = JSON.stringify(payload);
+        body = buildJsonBody(payload);
       }
 
-      if (!finalHeaders["Content-Type"] && !finalHeaders["content-type"]) {
-        finalHeaders = {
-          ...headers,
-          "Content-Type": contentType,
-        };
+      if (!h["Content-Type"] && !h["content-type"]) {
+        h["Content-Type"] = contentType;
       }
-
-      return { body, headers: finalHeaders };
+      return { body, headers: h };
     }
 
     default:
-      return { headers };
+      return { headers: outHeaders() };
   }
 };
 
@@ -304,7 +318,16 @@ const inFlightByCacheName = new Map<string, Promise<void>>();
 const apiRequest = async <TData>(
   cacheName: string,
   payload: TData | FormData | null,
-  { url, method, headers = {}, mode = "cors", credentials = "include", responseType }: WorkerApiRequest,
+  {
+    url,
+    method,
+    headers = {},
+    mode = "cors",
+    credentials = "same-origin",
+    responseType,
+    timeoutMs,
+    formDataFileFieldName,
+  }: WorkerApiRequest,
   requestId?: string | null,
   hookId?: string | null,
 ): Promise<void> => {
@@ -330,6 +353,11 @@ const apiRequest = async <TData>(
     inFlightControllers.set(requestId, controller);
   }
 
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  if (timeoutMs != null && timeoutMs > 0) {
+    timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  }
+
   const promise = (async (): Promise<void> => {
     const fetchOptions: RequestInit = {
       method,
@@ -339,18 +367,27 @@ const apiRequest = async <TData>(
     };
 
     if (methodLower !== "get" && payload != null) {
-      const { body, headers: processedHeaders } = prepareRequestBody(payload, headers);
+      const { body, headers: processedHeaders } = prepareRequestBody(
+        payload,
+        headers,
+        formDataFileFieldName != null && formDataFileFieldName !== "" ? { formDataFileFieldName } : undefined,
+      );
       if (body !== undefined) fetchOptions.body = body;
       fetchOptions.headers = processedHeaders;
     } else {
-      fetchOptions.headers = omitContentType(headers);
+      fetchOptions.headers = omitContentType({ ...headers });
     }
 
     try {
       const response = await fetch(url, fetchOptions);
 
-      if (!response.ok) {
-        callerResponse(cacheName, { error: response.statusText, code: response.status }, hookId, response.status);
+      if (response.status >= 400) {
+        callerResponse(
+          cacheName,
+          makeError("http", response.statusText, { status: response.status, code: String(response.status) }),
+          hookId,
+          response.status,
+        );
         return;
       }
 
@@ -381,9 +418,10 @@ const apiRequest = async <TData>(
         return;
       }
       const err = error as Error;
-      const code = err.name === "TypeError" ? "NETWORK_ERROR" : "UNKNOWN";
-      callerResponse(cacheName, { error: err.message, code }, hookId);
+      const code = err.name === "TypeError" ? CODE_NETWORK_ERROR : CODE_UNKNOWN;
+      callerResponse(cacheName, makeError("network", err.message, { code }), hookId);
     } finally {
+      if (timeoutId != null) clearTimeout(timeoutId);
       if (requestId) {
         inFlightControllers.delete(requestId);
       }
@@ -399,7 +437,11 @@ const onRequest = <TData>(dataRequest: DataRequest<TData>): void => {
   const { cacheName, type, payload, request, requestId, hookId } = dataRequest;
 
   if (!isNonEmptyString(type)) {
-    callerResponse("error", { error: "Invalid request: type is required", code: "INVALID_REQUEST" }, hookId);
+    callerResponse(
+      "error",
+      makeError("validation", "Invalid request: type is required", { code: CODE_INVALID_REQUEST }),
+      hookId,
+    );
     return;
   }
   const lowerType = normalizeKey(type);
@@ -410,7 +452,11 @@ const onRequest = <TData>(dataRequest: DataRequest<TData>): void => {
   }
 
   if (!isNonEmptyString(cacheName)) {
-    callerResponse("error", { error: "Invalid request: cacheName is required", code: "INVALID_REQUEST" }, hookId);
+    callerResponse(
+      "error",
+      makeError("validation", "Invalid request: cacheName is required", { code: CODE_INVALID_REQUEST }),
+      hookId,
+    );
     return;
   }
   const lowerCacheName = normalizeKey(cacheName);
@@ -418,7 +464,7 @@ const onRequest = <TData>(dataRequest: DataRequest<TData>): void => {
   if (lowerType === "get") {
     const requestedData = get(lowerCacheName);
     if (requestedData === undefined) {
-      callerResponse(lowerCacheName, { error: "Cache miss", code: "CACHE_MISS" }, hookId);
+      callerResponse(lowerCacheName, makeError("validation", "Cache miss", { code: CODE_CACHE_MISS }), hookId);
     } else {
       callerResponse(lowerCacheName, requestedData, hookId);
     }
@@ -427,7 +473,7 @@ const onRequest = <TData>(dataRequest: DataRequest<TData>): void => {
       if (payload == null) {
         callerResponse(
           "error",
-          { error: "Invalid request: payload is required for set", code: "INVALID_REQUEST" },
+          makeError("validation", "Invalid request: payload is required for set", { code: CODE_INVALID_REQUEST }),
           hookId,
         );
         return;
@@ -438,7 +484,9 @@ const onRequest = <TData>(dataRequest: DataRequest<TData>): void => {
       if (methodLower !== "get" && payload == null) {
         callerResponse(
           "error",
-          { error: "Invalid request: payload is required for non-GET API request", code: "INVALID_REQUEST" },
+          makeError("validation", "Invalid request: payload is required for non-GET API request", {
+            code: CODE_INVALID_REQUEST,
+          }),
           hookId,
         );
         return;
@@ -461,6 +509,12 @@ const onCancel = (requestId: string): void => {
 
 type WorkerMessageData = { dataRequest?: DataRequest<unknown> };
 
+/**
+ * Public API: handle incoming messages from the main thread.
+ * Expects payload shape { dataRequest?: DataRequest }. Dispatches to get/set/delete/cancel.
+ * Responses are sent via postMessage: { cacheName, data?, meta?, hookId?, httpStatus? }.
+ * Errors are sent as data: { kind: "http"|"network"|"validation", message, status?, code? }.
+ */
 export function handleMessage(data: unknown): void {
   if (data === null || typeof data !== "object") return;
   const dataRequest = (data as WorkerMessageData).dataRequest;

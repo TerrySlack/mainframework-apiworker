@@ -11,6 +11,10 @@ export interface RequestConfig {
   credentials?: "include" | "same-origin" | "omit";
   /** Omit or "json": allow in-flight dedupe. "binary" or "stream": no early return, always process request. */
   responseType?: ResponseType;
+  /** Abort request after this many milliseconds. */
+  timeoutMs?: number;
+  /** FormData field name for File/Blob parts. Default "Files". */
+  formDataFileFieldName?: string;
 }
 
 export type RunMode = "auto" | "manual" | "once";
@@ -42,15 +46,22 @@ export interface BinaryResponseMeta {
   contentDisposition: string | null;
 }
 
+/** Type-only: binary parse results use Symbol.for("WorkerApiBinary"). Value lives in api.worker. */
+declare const BINARY_MARKER: unique symbol;
+
 export type BinaryParseResult = {
-  __binary: true;
+  [BINARY_MARKER]: true;
   data: ArrayBuffer;
   contentType: string;
 } & Pick<BinaryResponseMeta, "contentDisposition">;
 
+export type WorkerErrorKind = "http" | "network" | "validation";
+
 export interface WorkerError {
+  kind: WorkerErrorKind;
   message: string;
-  code?: string | number | undefined;
+  status?: number;
+  code?: string;
 }
 
 export interface QueueEntry<T> {
@@ -89,12 +100,12 @@ export type WorkerResponseMessage =
 
 /**
  * Payload shape for worker postMessage. Use for client onmessage:
- * MessageEvent<WorkerMessagePayload>. Covers success, binary, and error (top-level or data.error/code).
+ * MessageEvent<WorkerMessagePayload>. Success: data = body. Error: data = WorkerError (kind, message, status?, code?).
  */
 export interface WorkerMessagePayload {
   cacheName?: string;
-  /** Response body or error payload from worker. Typed so .error and .code are safe to read. */
-  data?: { error?: unknown; code?: string | number };
+  /** Response body or error payload (WorkerError when kind is "http"|"network"|"validation"). */
+  data?: unknown;
   meta?: BinaryResponseMeta;
   error?: WorkerError;
   hookId?: string;

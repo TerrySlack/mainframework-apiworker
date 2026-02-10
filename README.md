@@ -1,5 +1,7 @@
 # @mainframework/api-reqpuest-provider-worker-hook
 
+**Requires Node.js 18+** (for global `fetch` when running in Node; browsers rely on their native fetch).
+
 A library that moves API calls and cache storage off the main thread using a Web Worker. It can be used **with React** (via the `useApiWorker` hook) or **with vanilla TypeScript/JavaScript** (by talking to the worker with `postMessage`).
 
 ---
