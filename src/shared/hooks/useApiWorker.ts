@@ -4,10 +4,9 @@ import { uniqueId } from "../utils/uniqueId";
 import type {
   DataRequest,
   QueueEntry,
-  RequestConfig,
   UseApiWorkerConfig,
   UseApiWorkerReturn,
-  WorkerApiRequest,
+  WorkerMessagePayload,
 } from "../types/types";
 import { useCustomCallback } from "./useCustomCallback";
 
@@ -52,16 +51,8 @@ const responseQueue: Record<string, QueueEntry<unknown>> = {};
 
 const updater = (n: number) => n + 1;
 
-const toWorkerRequest = (requestConfig: RequestConfig): WorkerApiRequest => ({
-  url: requestConfig.url,
-  method: requestConfig.method,
-  mode: requestConfig.mode,
-  headers: requestConfig.headers,
-  credentials: requestConfig.credentials,
-});
-
 // Worker message handler
-apiWorker.onmessage = (event: MessageEvent) => {
+apiWorker.onmessage = (event: MessageEvent<WorkerMessagePayload>) => {
   const { data, cacheName, meta } = event.data;
   const errorPayload = event.data.error ?? event.data.data?.error;
   const errorCode = event.data.data?.code;
@@ -72,8 +63,17 @@ apiWorker.onmessage = (event: MessageEvent) => {
   if (cacheName !== "error" && normalizeKey(entry.cacheName) !== normalizeKey(cacheName)) return;
 
   if (errorPayload) {
+    const message =
+      typeof errorPayload === "string"
+        ? errorPayload
+        : typeof errorPayload === "object" &&
+            errorPayload !== null &&
+            "message" in errorPayload &&
+            typeof (errorPayload as { message: unknown }).message === "string"
+          ? (errorPayload as { message: string }).message
+          : "Unknown error";
     entry.error = {
-      message: typeof errorPayload === "string" ? errorPayload : String(errorPayload),
+      message,
       code: errorCode,
     };
     entry.loading = false;
@@ -92,7 +92,7 @@ apiWorker.onmessage = (event: MessageEvent) => {
 // HOOK
 // ============================================================================
 
-export type { UseApiWorkerReturn } from "../types/types";
+export type { RequestConfig, UseApiWorkerConfig, UseApiWorkerReturn } from "../types/types";
 
 export const useApiWorker = <T>(config: UseApiWorkerConfig): UseApiWorkerReturn<T> => {
   const { cacheName, request: requestConfig, data: configData, runMode = "auto", enabled = true } = config;
@@ -157,8 +157,8 @@ export const useApiWorker = <T>(config: UseApiWorkerConfig): UseApiWorkerReturn<
           cacheName,
           hookId,
           requestId,
-          payload: configData ?? requestConfig.body,
-          request: toWorkerRequest(requestConfig),
+          payload: configData,
+          request: requestConfig,
         }
       : { type: "get", cacheName, hookId };
 

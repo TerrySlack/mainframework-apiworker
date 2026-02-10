@@ -9,9 +9,9 @@ import type {
   WorkerApiRequest,
 } from "../../types/types";
 
-const callerResponse = <T>(cacheName: string, data: T, hookId?: string | null): void => {
-  if (data !== undefined && data !== null) {
-    self.postMessage({ cacheName, data, hookId });
+const callerResponse = <T>(cacheName: string, data: T, hookId?: string | null, httpStatus?: number): void => {
+  if ((data !== undefined && data !== null) || httpStatus !== undefined) {
+    self.postMessage({ cacheName, data: data ?? null, hookId, httpStatus });
   }
 };
 
@@ -24,13 +24,14 @@ const callerResponseBinary = (
   data: ArrayBuffer,
   meta: BinaryResponseMeta,
   hookId?: string | null,
+  httpStatus?: number,
 ): void => {
   if (data) {
-    self.postMessage({ cacheName, data, meta, hookId }, [data]);
+    self.postMessage({ cacheName, data, meta, hookId, httpStatus }, [data]);
   }
 };
 
-const store: Record<string, unknown> = Object.create(null);
+const store = Object.create(null) as Record<string, unknown>;
 const normalizeKey = (key: string) => key.toLocaleLowerCase();
 const get = <TData>(key: string): TData | undefined => store[normalizeKey(key)] as TData | undefined;
 const set = <TData>(key: string, value: TData): void => {
@@ -42,17 +43,19 @@ const remove = (key: string): void => {
 
 /** Returns headers without Content-Type (either casing). Use when FormData sets it automatically. */
 const omitContentType = (headers: Record<string, string>): Record<string, string> => {
-  const { "Content-Type": _ct, "content-type": _ctLower, ...rest } = headers;
+  const rest = { ...headers };
+  delete rest["Content-Type"];
+  delete rest["content-type"];
   return rest;
 };
 
 const isBinaryResponse = (r: unknown): r is BinaryParseResult =>
   !!r && typeof r === "object" && "__binary" in r && (r as { __binary: unknown }).__binary === true;
 
-const commit = <TData>(cacheName: string, data: TData, hookId?: string | null): void => {
+const commit = <TData>(cacheName: string, data: TData, hookId?: string | null, httpStatus?: number): void => {
   if (cacheName) {
     set(normalizeKey(cacheName), data);
-    callerResponse(cacheName, data, hookId);
+    callerResponse(cacheName, data, hookId, httpStatus);
     return;
   }
 
@@ -63,7 +66,7 @@ const commit = <TData>(cacheName: string, data: TData, hookId?: string | null): 
  * Parses response based on content-type.
  * Returns parsed data for JSON/text, or { __binary, data, contentType, contentDisposition } for binary.
  */
-const parseResponseByContentType = async (response: Response): Promise<unknown | BinaryParseResult> => {
+const parseResponseByContentType = async (response: Response): Promise<unknown> => {
   const contentType = response.headers.get("content-type")?.toLocaleLowerCase() || "";
   const contentLength = response.headers.get("content-length");
 
@@ -110,7 +113,12 @@ const appendToFormData = (formData: FormData, key: string, value: unknown): void
   }
 
   if (value !== undefined && value !== null) {
-    formData.append(key, String(value));
+    if (typeof value === "object") {
+      formData.append(key, JSON.stringify(value));
+    } else {
+      const primitive = value as string | number | boolean | bigint | symbol;
+      formData.append(key, String(primitive));
+    }
   }
 };
 
@@ -151,7 +159,9 @@ const createFormDataIfBlobOrFile = (payload: unknown): FormData | null => {
 
   // Safe iteration - iterate forward, then clear
   for (let i = 0; i < stack.length; i++) {
-    const { key, value } = stack[i];
+    const entry = stack[i];
+    if (entry === undefined) continue;
+    const { key, value } = entry;
 
     if (value instanceof File || value instanceof Blob) {
       hasFile = true;
@@ -228,7 +238,7 @@ const prepareRequestBody = (
 
     case "arraybufferview":
       return {
-        body: payload as unknown as BodyInit,
+        body: payload as BodyInit,
         headers,
       };
 
@@ -287,6 +297,7 @@ const prepareRequestBody = (
 };
 
 const inFlightControllers: AbortControllers = new Map();
+const inFlightByCacheName = new Map<string, Promise<void>>();
 
 const apiRequest = async <TData>(
   cacheName: string,
@@ -295,61 +306,82 @@ const apiRequest = async <TData>(
   requestId?: string | null,
   hookId?: string | null,
 ): Promise<void> => {
+  const existing = inFlightByCacheName.get(cacheName);
+  if (existing) {
+    await existing;
+    const cached = get(cacheName);
+    if (cached !== undefined) callerResponse(cacheName, cached, hookId);
+    return;
+  }
+
   const controller = new AbortController();
   if (requestId) {
     inFlightControllers.set(requestId, controller);
   }
 
-  const fetchOptions: RequestInit = {
-    method,
-    mode,
-    credentials,
-    signal: controller.signal,
-  };
+  const promise = (async (): Promise<void> => {
+    const fetchOptions: RequestInit = {
+      method,
+      mode,
+      credentials,
+      signal: controller.signal,
+    };
 
-  if (method.toUpperCase() !== "GET" && payload != null) {
-    const { body, headers: processedHeaders } = prepareRequestBody(payload, headers);
-    fetchOptions.body = body;
-    fetchOptions.headers = processedHeaders;
-  } else {
-    fetchOptions.headers = omitContentType(headers);
-  }
-
-  try {
-    const response = await fetch(url, fetchOptions);
-
-    if (!response.ok) {
-      callerResponse(cacheName, { error: response.statusText, code: response.status }, hookId);
-      return;
-    }
-
-    const responseData = await parseResponseByContentType(response);
-
-    if (isBinaryResponse(responseData)) {
-      callerResponseBinary(
-        cacheName,
-        responseData.data,
-        {
-          contentType: responseData.contentType,
-          contentDisposition: responseData.contentDisposition ?? null,
-        },
-        hookId,
-      );
+    if (method.toUpperCase() !== "GET" && payload != null) {
+      const { body, headers: processedHeaders } = prepareRequestBody(payload, headers);
+      if (body !== undefined) fetchOptions.body = body;
+      fetchOptions.headers = processedHeaders;
     } else {
-      commit(cacheName, responseData, hookId);
+      fetchOptions.headers = omitContentType(headers);
     }
-  } catch (error) {
-    if ((error as Error).name === "AbortError") {
-      return;
+
+    try {
+      const response = await fetch(url, fetchOptions);
+
+      if (!response.ok) {
+        callerResponse(cacheName, { error: response.statusText, code: response.status }, hookId, response.status);
+        return;
+      }
+
+      if (response.status === 204) {
+        set(normalizeKey(cacheName), null);
+        callerResponse(cacheName, null, hookId, 204);
+        return;
+      }
+
+      const responseData = await parseResponseByContentType(response);
+
+      if (isBinaryResponse(responseData)) {
+        callerResponseBinary(
+          cacheName,
+          responseData.data,
+          {
+            contentType: responseData.contentType,
+            contentDisposition: responseData.contentDisposition ?? null,
+          },
+          hookId,
+          response.status,
+        );
+      } else {
+        commit(cacheName, responseData, hookId, response.status);
+      }
+    } catch (error) {
+      if ((error as Error).name === "AbortError") {
+        return;
+      }
+      const err = error as Error;
+      const code = err.name === "TypeError" ? "NETWORK_ERROR" : "UNKNOWN";
+      callerResponse(cacheName, { error: err.message, code }, hookId);
+    } finally {
+      if (requestId) {
+        inFlightControllers.delete(requestId);
+      }
+      inFlightByCacheName.delete(cacheName);
     }
-    const err = error as Error;
-    const code = err.name === "TypeError" ? "NETWORK_ERROR" : "UNKNOWN";
-    callerResponse(cacheName, { error: err.message, code }, hookId);
-  } finally {
-    if (requestId) {
-      inFlightControllers.delete(requestId);
-    }
-  }
+  })();
+
+  inFlightByCacheName.set(cacheName, promise);
+  await promise;
 };
 
 const onRequest = <TData>(dataRequest: DataRequest<TData>): void => {
@@ -386,7 +418,7 @@ const onRequest = <TData>(dataRequest: DataRequest<TData>): void => {
     if (!request) {
       set(lowerCacheName, payload);
     } else {
-      apiRequest(lowerCacheName, payload ?? null, request, requestId, hookId);
+      void apiRequest(lowerCacheName, payload ?? null, request, requestId, hookId);
     }
   } else if (lowerType === "delete") {
     remove(lowerCacheName);
@@ -402,9 +434,11 @@ const onCancel = (requestId: string): void => {
   }
 };
 
-onmessage = ({ data }: MessageEvent) => {
-  const dataRequest = data?.dataRequest;
-  if (dataRequest) {
-    onRequest(dataRequest);
-  }
+type WorkerMessageData = { dataRequest?: DataRequest<unknown> };
+
+onmessage = (event: MessageEvent): void => {
+  const data = event.data as unknown;
+  if (data === null || typeof data !== "object") return;
+  const dataRequest = (data as WorkerMessageData).dataRequest;
+  if (dataRequest !== undefined) onRequest(dataRequest);
 };

@@ -1,10 +1,9 @@
-import { Dispatch, SetStateAction } from "react";
+import type { Dispatch, SetStateAction } from "react";
 
 export interface RequestConfig {
   url: string;
   method: "GET" | "get" | "POST" | "post" | "PATCH" | "patch" | "DELETE" | "delete";
   mode?: "cors" | "no-cors" | "navigate" | "same-origin";
-  body?: unknown;
   headers?: Record<string, string>;
   credentials?: "include" | "same-origin" | "omit";
 }
@@ -21,7 +20,7 @@ export interface UseApiWorkerConfig {
 
 export type WorkerDataRequestType = "get" | "set" | "delete" | "cancel";
 
-export type WorkerApiRequest = Omit<RequestConfig, "body">;
+export type WorkerApiRequest = RequestConfig;
 
 export interface DataRequest<T = unknown> {
   hookId?: string;
@@ -46,7 +45,7 @@ export type BinaryParseResult = {
 
 export interface WorkerError {
   message: string;
-  code?: string | number;
+  code?: string | number | undefined;
 }
 
 export interface QueueEntry<T> {
@@ -82,6 +81,20 @@ export type WorkerResponseMessage =
   | { cacheName: string; data: unknown }
   | { cacheName: string; data: ArrayBuffer; meta: BinaryResponseMeta }
   | { cacheName: string; error: WorkerError };
+
+/**
+ * Payload shape for worker postMessage. Use for client onmessage:
+ * MessageEvent<WorkerMessagePayload>. Covers success, binary, and error (top-level or data.error/code).
+ */
+export interface WorkerMessagePayload {
+  cacheName?: string;
+  /** Response body or error payload from worker. Typed so .error and .code are safe to read. */
+  data?: { error?: unknown; code?: string | number };
+  meta?: BinaryResponseMeta;
+  error?: WorkerError;
+  hookId?: string;
+  httpStatus?: number;
+}
 
 export interface StackArray {
   key: string;

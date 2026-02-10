@@ -1,36 +1,43 @@
 {
-  "exclude": ["dist", "node_modules"],
-  "include": ["src"],
   "compilerOptions": {
-    // ESM-only library build
-    "declaration": true,
-    "declarationDir": "./dist",
-    "emitDeclarationOnly": true,
-    "esModuleInterop": true,
+    "allowJs": false,
 
-    // Interop & correctness
-    "forceConsistentCasingInFileNames": true,
+    // Path aliases (keep if you use them)
+    "baseUrl": "src",
+    "paths": {
+      "Components/*": ["components/*"],
+      "Hooks/*": ["hooks/*"],
+      "Utils/*": ["utils/*"]
+    },
 
-    // React JSX transform
-    "jsx": "react-jsx",
-
-    // Target & libs
-    "lib": ["dom", "esnext"],
+    // Modern ESM + bundler-aware resolution
+    "target": "ESNext",
     "module": "ESNext",
     "moduleResolution": "Bundler",
+    "moduleDetection": "force",
+    "jsx": "react-jsx",
 
-    // Strictness
-    "noFallthroughCasesInSwitch": true,
-    "noImplicitReturns": true,
-    "noUnusedLocals": true,
-    "noUnusedParameters": true,
+    // DOM context for the React side
+    "lib": ["ESNext", "DOM", "DOM.Iterable"],
+    "types": [],
 
-    // Emit locations
-    "outDir": "./dist",
-    "rootDir": "./src",
-    "skipLibCheck": true,
-    "sourceMap": true,
+    // Strictness & interop
     "strict": true,
-    "target": "esnext"
-  }
+    "exactOptionalPropertyTypes": true,
+    "noUncheckedIndexedAccess": true,
+    "useUnknownInCatchVariables": true,
+    "noImplicitOverride": true,
+    "verbatimModuleSyntax": true,
+
+    "esModuleInterop": true,
+    "isolatedModules": true,
+    "resolveJsonModule": true,
+
+    // Dev ergonomics
+    "incremental": true,
+    "noEmit": true,
+    "skipLibCheck": true
+  },
+  "include": ["src"],
+  "exclude": ["node_modules", "dist"]
 }
