@@ -1,7 +1,11 @@
 {
-  "transform": {"^.+\\.(t|j)sx?$": "ts-jest"},
+  "transform": { "^.+\\.(t|j)sx?$": "<rootDir>/jest-import-meta-transform.cjs" },
   "testRegex": "(/tests/.*|(\\.|/)(test|spec))\\.(jsx?|tsx?)$",
   "moduleFileExtensions": ["ts", "tsx", "js", "jsx", "json", "node"],
   "testEnvironment": "jsdom",
-  "passWithNoTests": true
+  "passWithNoTests": true,
+  "setupFiles": ["<rootDir>/jest.worker-setup.ts"],
+  "moduleNameMapper": {
+    "@mainframework/is-deep-equal": "<rootDir>/jest-is-deep-equal-stub.cjs"
+  }
 }

@@ -1,14 +1,14 @@
 {
   "name": "@mainframework/api-reqpuest-provider-worker-hook",
   "version": "2.2.8",
-  "description": "Package to handle api requests with a hook, provider and web worker",
+  "description": "Package to handle api requests with a hook and web worker",
   "type": "module",
   "main": "./dist/index.js",
   "exports": {
     ".": {
+      "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
-      "default": "./dist/index.js",
-      "types": "./dist/index.d.ts"
+      "default": "./dist/index.js"
     }
   },
   "types": "./dist/index.d.ts",
@@ -27,15 +27,14 @@
     "clean": "rimraf dist",
     "lint-staged": "lint-staged",
     "prebuild": "yarn husky && yarn clean",
-    "build": "yarn prebuild && yarn build:esm",
-    "build:esm": "tsc",
-    "test": "jest --runInBand",
-    "test:watch": "jest --watchAll --runInBand",
-    "test:coverage": "jest --coverage --runInBand"
+    "build": "yarn prebuild && rollup -c && tsc -p tsconfig.build.json",
+    "test": "jest -c jestconfig.json --runInBand",
+    "test:watch": "jest -c jestconfig.json --watchAll --runInBand",
+    "test:coverage": "jest -c jestconfig.json --coverage --runInBand"
   },
   "lint-staged": {
     "*.{js,jsx,ts,tsx}": [
-      "eslint --max-warnings=0"
+      "eslint --max-warnings=0 --no-warn-ignored"
     ],
     "*.{js,jsx,ts,tsx,json,css,md}": [
       "prettier --write"
@@ -66,6 +65,10 @@
     "@eslint-react/eslint-plugin": "^2.12.2",
     "@eslint/js": "^10.0.1",
     "@mainframework/is-deep-equal": "^1.0.9",
+    "@rollup/plugin-node-resolve": "^11.0.0",
+    "@rollup/plugin-replace": "^6.0.0",
+    "@rollup/plugin-typescript": "^12.0.0",
+    "@testing-library/dom": "^10.0.0",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",
     "@testing-library/user-event": "^14.6.1",
@@ -83,9 +86,12 @@
     "jest-canvas-mock": "^2.5.2",
     "jest-environment-jsdom": "^30.2.0",
     "lint-staged": "^16.2.7",
+    "node-fetch": "3.3.2",
     "prettier": "^3.8.1",
     "react": "^19.2.4",
+    "react-dom": "^19.2.4",
     "rimraf": "^6.1.2",
+    "rollup": "^4.0.0",
     "ts-jest": "^29.4.6",
     "tslib": "^2.8.1",
     "typescript": "^5.9.3",

@@ -14,6 +14,7 @@ export default [
       "coverage/**",
       ".next/**",
       "out/**",
+      ".rollup.cache/**",
       "node_modules/**",
       "pnpm-lock.yaml",
       "package-lock.json",
@@ -28,7 +29,7 @@ export default [
   //    (requires parserOptions.project below)
   ...tseslint.configs.recommendedTypeChecked,
 
-  // 4) Language options for TS files (type-aware)
+  // 4) Language options for TS/TSX (type-aware; include matches tsconfig)
   {
     files: ["**/*.ts", "**/*.tsx"],
     languageOptions: {
@@ -81,6 +82,18 @@ export default [
         ...globals.node,
         ...globals.es2021,
       },
+    },
+  },
+
+  // 7) Test files: relax strict rules for Jest matchers (expect.objectContaining etc. use any)
+  {
+    files: ["**/*.test.ts", "**/*.test.tsx", "**/*.spec.ts", "**/*.spec.tsx"],
+    rules: {
+      "@typescript-eslint/no-unsafe-assignment": "off",
+      "@typescript-eslint/no-unsafe-call": "off",
+      "@typescript-eslint/no-unsafe-member-access": "off",
+      "@typescript-eslint/no-unsafe-return": "off",
+      "@typescript-eslint/no-unsafe-argument": "off",
     },
   },
 ];

@@ -2,7 +2,10 @@
 import { useRef } from "react";
 import { isEqual } from "@mainframework/is-deep-equal";
 
-export const useCustomCallback = <T extends (...args: any[]) => any>(callback: T, dependencies: unknown[]): T => {
+export const useCustomCallback = <T extends (...args: unknown[]) => unknown>(
+  callback: T,
+  dependencies: unknown[],
+): T => {
   const refCallback = useRef<T>(callback);
   const refDependencies = useRef<unknown[]>(dependencies);
 
@@ -13,7 +16,9 @@ export const useCustomCallback = <T extends (...args: any[]) => any>(callback: T
   }
 
   // Stable callback, always calls latest callback
-  const stableCallback = useRef((...args: Parameters<T>): ReturnType<T> => refCallback.current(...args)).current;
+  const stableCallback = useRef(
+    (...args: Parameters<T>): ReturnType<T> => refCallback.current(...args) as ReturnType<T>,
+  ).current;
 
   return stableCallback as T;
 };

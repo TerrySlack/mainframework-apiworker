@@ -38,6 +38,6 @@
     "noEmit": true,
     "skipLibCheck": true
   },
-  "include": ["src"],
+  "include": ["src", "jest.worker-setup.ts"],
   "exclude": ["node_modules", "dist"]
 }

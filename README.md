@@ -1,30 +1,21 @@
-### A React package, that creates an api worker, provider, hook and store. Move your api calls and store off of the main thread and into a web worker
+### A React package that uses a hook and web worker to move API calls and store off the main thread.
 
 ### Note: Version 1.x is deprecated. Please review these notes to upgrade
 
-### Installation:
+### Download and streaming behavior (as of this version)
+
+Responses are **all-or-nothing**: the worker does **not** stream incrementally. For each request, the full response body (JSON, text, or binary) is buffered in the worker and then sent to the client in a single message. The client does not receive data until the entire response has been received. For large files (e.g. audio or video from a single URL), playback cannot start until the full file has been downloaded.
+
+### Installation
 
 npm i @mainframework/api-reqpuest-provider-worker-hook
-yarn @mainframework/api-reqpuest-provider-worker-hook
+yarn add @mainframework/api-reqpuest-provider-worker-hook
 
 ### Usage
 
-### App.tsx
+Everything is driven by the `useApiWorker` hook—no provider or wrapper required. Use the hook wherever you need to fetch or read cached data.
 
-Wrap your application with the ApiWorkerProvider
-
-```JS | TS
-import {App} from "./App";
-import { ApiWorkerProvider } from "@mainframework/api-reqpuest-provider-worker-hook";
-
-export const App = () => (
-  <ApiWorkerProvider>
-    <App />
-  </ApiWorkerProvider>
-);
-```
-
-### making a request
+### Making a request
 
 Requests are made by passing in a request object.  
 Here's the typing for a request object to pass to the hook

@@ -1,11 +1,16 @@
 import type { Dispatch, SetStateAction } from "react";
 
+/** When "binary" or "stream", in-flight dedupe is skipped so we always run the request and return real response (no stale). */
+export type ResponseType = "json" | "binary" | "stream";
+
 export interface RequestConfig {
   url: string;
   method: "GET" | "get" | "POST" | "post" | "PATCH" | "patch" | "DELETE" | "delete";
   mode?: "cors" | "no-cors" | "navigate" | "same-origin";
   headers?: Record<string, string>;
   credentials?: "include" | "same-origin" | "omit";
+  /** Omit or "json": allow in-flight dedupe. "binary" or "stream": no early return, always process request. */
+  responseType?: ResponseType;
 }
 
 export type RunMode = "auto" | "manual" | "once";
