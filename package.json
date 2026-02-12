@@ -1,7 +1,7 @@
 {
-  "name": "@mainframework/api-reqpuest-provider-worker-hook",
-  "version": "2.2.8",
-  "description": "Package to handle api requests with a hook and web worker",
+  "name": "@mainframework/api-request-worker",
+  "version": "0.0.0",
+  "description": "Offloads API requests and application state to a Web Worker to keep the UI thread fast.",
   "type": "module",
   "main": "./dist/index.js",
   "exports": {
@@ -14,12 +14,12 @@
   "types": "./dist/index.d.ts",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/TerrySlack/mainframework-api-hook-provider-worker.git"
+    "url": "git+https://github.com/TerrySlack/mainframework-apiworker.git"
   },
   "bugs": {
-    "url": "https://github.com/TerrySlack/mainframework-api-hook-provider-worker/issues"
+    "url": "https://github.com/TerrySlack/mainframework-apiworker/issues"
   },
-  "homepage": "https://github.com/TerrySlack/mainframework-api-hook-provider-worker#readme",
+  "homepage": "https://github.com/TerrySlack/mainframework-apiworkere",
   "scripts": {
     "husky-setup": "npx husky init",
     "husky": "husky",

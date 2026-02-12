@@ -1,43 +1,402 @@
-# @mainframework/api-reqpuest-provider-worker-hook
+# @mainframework/api-request-worker
 
 **Requires Node.js 18+** (for global `fetch` when running in Node; browsers rely on their native fetch).
 
-A library that moves API calls and cache storage off the main thread using a Web Worker. It can be used **with React** (via the `useApiWorker` hook) or **with vanilla TypeScript/JavaScript** (by talking to the worker with `postMessage`).
+A framework-agnostic, Web Worker–backed data layer designed to keep your UI thread responsive and your application fast. This library moves all API requests and application state management into a dedicated singleton worker, handling caching, in-flight request deduplication, streaming and binary responses, while exposing data to your main thread on demand.
+
+The library is **framework- and library-agnostic**: you use the worker via the standard `postMessage` API from vanilla JavaScript or from any framework (React, Angular, Vue, Preact, SolidJS, etc.). A **React hook (`useApiWorker`) is provided as a convenience** for React engineers; you may use it or implement your own integration against the worker protocol.
 
 ---
 
-## Note: Version 1.x is deprecated
+## Why Use This Library?
 
-Please use the current API described below when upgrading from 1.x.
+- **Non-blocking UI**: All network requests and state management happen off the main thread, keeping your UI buttery smooth
+- **Built-in caching**: Automatic response caching with flexible cache key management
+- **Request deduplication**: Multiple requests for the same resource are automatically collapsed into a single network call
+- **Streaming support**: Handle large files and real-time streams with incremental chunk delivery
+- **Binary file support**: First-class support for images, PDFs, and other binary content
+- **Framework agnostic**: Works in vanilla JavaScript or with any framework
+- **No framework lock-in**: Use the worker from any stack; the included React hook is optional
+- **TypeScript ready**: Full type definitions included
 
 ---
 
-## Download and streaming behavior
+## Response Types and Download Behavior
 
-Responses are **all-or-nothing**: the worker does **not** stream incrementally. For each request, the full response body (JSON, text, or binary) is buffered in the worker and then sent to the client in a single message. The client does not receive data until the entire response has been received. For large files (e.g. audio or video from a single URL), playback cannot start until the full file has been downloaded.
+The library supports three response types to handle different use cases:
+
+- **`responseType: "json"`** (default): Full response is buffered in the worker and sent to the client in a single message. The client receives the complete response (JSON or text) after the entire download completes.
+
+- **`responseType: "binary"`**: Full binary response is buffered in the worker and sent as an `ArrayBuffer` in a single message. Perfect for complete binary files like images, PDFs, or downloadable documents.
+
+- **`responseType: "stream"`**: Responses are streamed incrementally to the client. The worker sends chunks as they arrive (`start` → `chunk` → `chunk` → ... → `end`), enabling playback of audio/video streams to begin before the full file downloads. The React hook automatically accumulates chunks and returns a `Blob` when complete. For vanilla JavaScript, you handle stream events manually for maximum control.
+
+Binary and stream responses are not stored in the worker cache; only json/text responses are cached.
 
 ---
 
 ## Installation
 
 ```bash
-npm i @mainframework/api-reqpuest-provider-worker-hook
+npm i @mainframework/api-request-worker
 # or
-yarn add @mainframework/api-reqpuest-provider-worker-hook
+yarn add @mainframework/api-request-worker
 ```
 
-**React:** peer dependency `react >= 19` is required when using the hook.
+If you use the optional React hook, a peer dependency `react >= 19` is required.
+
+---
+
+## Usage with Vanilla TypeScript / JavaScript
+
+The core of this library is a Web Worker that you communicate with via the standard `postMessage` API. This approach works in any JavaScript environment—no framework required. You create a Worker instance from the package's built worker script, send **dataRequests** via `postMessage`, and handle responses in `onmessage`.
+
+### Setting Up the Worker
+
+**With a bundler (Vite, webpack, etc.):**
+
+```ts
+const worker = new Worker(
+  new URL("node_modules/@mainframework/api-request-worker/dist/api.worker.js", import.meta.url),
+  { type: "module" },
+);
+```
+
+**Without a bundler:**
+
+Serve `node_modules/@mainframework/api-request-worker/dist/api.worker.js` from your web server and create the worker with that URL:
+
+```ts
+const worker = new Worker("/path/to/api.worker.js", { type: "module" });
+```
+
+### Message Protocol
+
+**Outgoing messages (main thread → worker):**
+
+Send a single object: `{ dataRequest: { ... } }`.
+
+| dataRequest.type | Description                                         | Required fields | Optional                                    |
+| ---------------- | --------------------------------------------------- | --------------- | ------------------------------------------- |
+| `"get"`          | Return cached value for `cacheName`.                | `cacheName`     | `hookId`                                    |
+| `"set"`          | Store payload and/or run API request, then respond. | `cacheName`     | `hookId`, `request`, `payload`, `requestId` |
+| `"delete"`       | Remove cache entry for `cacheName`.                 | `cacheName`     | `hookId`                                    |
+| `"cancel"`       | Abort in-flight request by `requestId`.             | —               | `requestId`                                 |
+
+**Key fields:**
+
+- **`cacheName`**: String; required for `get`, `set`, `delete`. Cache keys are normalized to lowercase.
+- **`request`**: API request configuration (`url`, `method`, `headers`, `credentials`, `responseType`, etc.). Required for `set` when making an API call.
+- **`payload`**: Request body for POST/PATCH requests. Required for `set` when there is no `request`, and for non-GET requests when `request` is provided.
+- **`requestId`**: Optional for `set` (enables request cancellation); required for `cancel`.
+
+**Incoming messages (worker → main thread):**
+
+Every message includes `error: { message: string }`.
+
+- **Success**: `data` contains the response body and `error.message` is `""` (empty string).
+- **Failure**: `data` is `null` and `error.message` contains the error description.
+
+**Message formats:**
+
+- **Success (JSON/text):** `{ cacheName, data, error: { message: "" }, hookId?, httpStatus? }`
+- **Success (binary):** `{ cacheName, data: ArrayBuffer, meta: { contentType?, contentDisposition }, error: { message: "" }, hookId?, httpStatus? }`
+- **Success (stream):** Multiple messages in sequence:
+  - `{ cacheName, stream: "start", meta: { contentType?, contentDisposition }, hookId?, httpStatus?, error: { message: "" } }`
+  - `{ cacheName, stream: "chunk", data: ArrayBuffer, hookId?, error: { message: "" } }` (one or more)
+  - `{ cacheName, stream: "resume", meta: { contentType?, contentDisposition }, hookId?, httpStatus?, error: { message: "" } }` (after retry)
+  - `{ cacheName, stream: "end", hookId?, error: { message: "" } }` (final message)
+- **Error:** `{ cacheName?, data: null, error: { message: "..." }, hookId? }`. If the request had no `cacheName`, match by `hookId` instead.
+
+**Common error messages:**
+
+- `"Invalid request: type is required"`
+- `"Invalid request: cacheName is required"`
+- `"Invalid request: payload is required for set"`
+- `"Invalid request: payload is required for non-GET API request"`
+- `"Cache miss"` (when requesting a non-existent cache key)
+- HTTP status text or fetch error messages for network failures
+
+### Request Configuration
+
+```ts
+interface RequestConfig {
+  url: string;
+  method: "GET" | "get" | "POST" | "post" | "PATCH" | "patch" | "DELETE" | "delete";
+  mode?: "cors" | "no-cors" | "navigate" | "same-origin";
+  headers?: Record<string, string>;
+  credentials?: "include" | "same-origin" | "omit";
+  responseType?: "json" | "binary" | "stream"; // default: "json"
+  timeoutMs?: number; // Abort request after this many milliseconds
+  formDataFileFieldName?: string; // FormData field name for File/Blob parts (default: "Files")
+  formDataKey?: string; // FormData key for root payload when building multipart form data
+  retries?: number; // For responseType "stream": retry attempts on connection loss (default: 3, max: 5)
+}
+```
+
+- **`responseType: "binary"`**: Use for complete binary files. The worker returns an `ArrayBuffer` and sets `meta.contentType` and `meta.contentDisposition` so you can construct a proper `Blob`: `new Blob([data], { type: meta?.contentType })`.
+
+- **`responseType: "stream"`**: Use for streaming audio/video or large files. The worker sends chunks incrementally. Supports automatic reconnection with configurable retries (default 3, max 5).
+
+### Vanilla JavaScript Examples
+
+**GET request from API (JSON response):**
+
+```ts
+const worker = new Worker(workerUrl, { type: "module" });
+const cacheName = "api-get-" + Date.now();
+
+worker.onmessage = (event) => {
+  const { cacheName: name, data, error, httpStatus } = event.data;
+  if (name === cacheName && error?.message === "" && data != null) {
+    console.log("Response:", data, "HTTP status:", httpStatus);
+  }
+};
+
+worker.postMessage({
+  dataRequest: {
+    type: "set",
+    cacheName,
+    request: { url: "https://api.example.com/data", method: "GET" },
+    hookId: "vanilla-get",
+  },
+});
+```
+
+**POST request with JSON payload:**
+
+```ts
+worker.postMessage({
+  dataRequest: {
+    type: "set",
+    cacheName: "api-post-" + Date.now(),
+    payload: { name: "New Item", description: "Created from vanilla JS" },
+    request: {
+      url: "https://api.example.com/items",
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+    },
+    hookId: "vanilla-post",
+  },
+});
+```
+
+**PATCH request:**
+
+```ts
+worker.postMessage({
+  dataRequest: {
+    type: "set",
+    cacheName: "update-item",
+    payload: { status: "completed", priority: "high" },
+    request: {
+      url: "https://api.example.com/items/123",
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+    },
+    hookId: "vanilla-patch",
+  },
+});
+```
+
+**Cache-only operations (no API call):**
+
+```ts
+const cacheName = "local-cache-" + Math.random();
+
+// Store data in cache without making an API request
+worker.postMessage({
+  dataRequest: {
+    type: "set",
+    cacheName,
+    payload: { userId: 42, preferences: { theme: "dark" } },
+    hookId: "cache-set",
+  },
+});
+
+// Retrieve cached data
+setTimeout(() => {
+  worker.postMessage({
+    dataRequest: { type: "get", cacheName, hookId: "cache-get" },
+  });
+}, 0);
+// onmessage will receive: { cacheName, data: { userId: 42, preferences: { theme: "dark" } }, error: { message: "" } }
+```
+
+**Handling cache misses:**
+
+```ts
+worker.postMessage({
+  dataRequest: { type: "get", cacheName: "nonexistent-key", hookId: "cache-miss" },
+});
+// onmessage receives: { cacheName: "nonexistent-key", data: null, error: { message: "Cache miss" }, hookId: "cache-miss" }
+```
+
+**Delete cached data:**
+
+```ts
+// First, store some data
+worker.postMessage({
+  dataRequest: { type: "set", cacheName: "temp-data", payload: { temp: true } },
+});
+
+// Later, delete it
+worker.postMessage({
+  dataRequest: { type: "delete", cacheName: "temp-data", hookId: "delete-op" },
+});
+// Response: { cacheName: "temp-data", data: { deleted: true }, error: { message: "" }, hookId: "delete-op" }
+
+// Subsequent get for the same cacheName returns: { error: { message: "Cache miss" } }
+```
+
+**Binary file download (complete file):**
+
+```ts
+worker.postMessage({
+  dataRequest: {
+    type: "set",
+    cacheName: "download-pdf-" + Date.now(),
+    request: {
+      url: "https://example.com/document.pdf",
+      method: "GET",
+      responseType: "binary",
+    },
+    hookId: "binary-download",
+  },
+});
+
+worker.onmessage = (event) => {
+  const { data, meta, error } = event.data;
+  if (error?.message === "" && data instanceof ArrayBuffer) {
+    // Build a Blob from the ArrayBuffer
+    const blob = new Blob([data], {
+      type: meta?.contentType ?? "application/octet-stream",
+    });
+
+    // Create download link or object URL
+    const url = URL.createObjectURL(blob);
+    console.log("Download ready:", url);
+  }
+};
+```
+
+**Streaming audio/video (incremental chunks):**
+
+```ts
+const cacheName = "audio-stream-" + Date.now();
+const chunks: ArrayBuffer[] = [];
+let meta: { contentType?: string; contentDisposition: string | null } | null = null;
+
+worker.onmessage = (event) => {
+  const msg = event.data;
+  if (msg.cacheName !== cacheName) return;
+
+  if (msg.stream === "start") {
+    // Stream started
+    chunks.length = 0;
+    meta = msg.meta ?? null;
+    console.log("Stream started, content type:", meta?.contentType);
+  } else if (msg.stream === "chunk" && msg.data) {
+    // Received a chunk
+    chunks.push(msg.data);
+    console.log(`Received chunk, total chunks: ${chunks.length}`);
+  } else if (msg.stream === "resume") {
+    // Stream resumed after reconnection
+    if (msg.meta) meta = msg.meta;
+    console.log("Stream resumed");
+  } else if (msg.stream === "end") {
+    // Stream complete
+    if (msg.error?.message === "" && chunks.length > 0) {
+      const blob = new Blob(chunks, meta?.contentType ? { type: meta.contentType } : undefined);
+      const url = URL.createObjectURL(blob);
+      console.log("Stream complete, blob URL:", url);
+
+      // Use the URL in an audio or video element
+      // audioElement.src = url;
+    } else {
+      console.error("Stream error:", msg.error?.message);
+    }
+  }
+};
+
+worker.postMessage({
+  dataRequest: {
+    type: "set",
+    cacheName,
+    request: {
+      url: "https://stream.example.com/audio.mp3",
+      method: "GET",
+      responseType: "stream",
+      retries: 3, // Retry up to 3 times on connection loss
+    },
+    hookId: "stream-audio",
+  },
+});
+```
+
+**Cancel an in-flight request:**
+
+```ts
+const requestId = "cancel-request-" + Date.now();
+
+// Start a large download
+worker.postMessage({
+  dataRequest: {
+    type: "set",
+    cacheName: "large-file",
+    request: {
+      url: "https://example.com/large-file.bin",
+      method: "GET",
+      responseType: "binary",
+    },
+    requestId,
+  },
+});
+
+// Cancel it after 100ms
+setTimeout(() => {
+  worker.postMessage({
+    dataRequest: { type: "cancel", requestId },
+  });
+}, 100);
+```
+
+**Handling validation errors:**
+
+```ts
+// Missing type
+worker.postMessage({ dataRequest: { cacheName: "x" } });
+// Response: { error: { message: "Invalid request: type is required" } }
+
+// Missing cacheName
+worker.postMessage({ dataRequest: { type: "get" } });
+// Response: { error: { message: "Invalid request: cacheName is required" } }
+
+// Missing payload for set
+worker.postMessage({ dataRequest: { type: "set", cacheName: "k" } });
+// Response: { error: { message: "Invalid request: payload is required for set" } }
+
+// Missing payload for POST
+worker.postMessage({
+  dataRequest: {
+    type: "set",
+    cacheName: "k",
+    request: { url: "...", method: "POST" },
+  },
+});
+// Response: { error: { message: "Invalid request: payload is required for non-GET API request" } }
+```
 
 ---
 
 ## Usage with React
 
-Everything is driven by the `useApiWorker` hook—no provider or wrapper required. Use the hook wherever you need to fetch or read cached data.
+For React applications, the library provides an optional `useApiWorker` hook that wraps the worker communication. You may use this hook or build your own React integration using the [Message Protocol](#message-protocol) above. No provider or wrapper component is required—use the hook wherever you need to fetch or read cached data.
 
 ### Hook API
 
 ```ts
-import { useApiWorker } from "@mainframework/api-reqpuest-provider-worker-hook";
+import { useApiWorker } from "@mainframework/api-request-worker";
 
 const result = useApiWorker({
   cacheName: "my-cache",       // required
@@ -50,65 +409,57 @@ const result = useApiWorker({
 // result: { data, meta, loading, error, refetch, deleteCache }
 ```
 
-- **`cacheName`** (required): Key used to store and retrieve data. Same cache name in different components shares the same cached value (see [Shared cacheName](#shared-cachename--multiple-subscribers)).
-- **`request`** (optional): When provided, the worker performs an API request and stores the result under `cacheName`. When omitted, the worker only reads from cache (or returns cache miss).
-- **`data`** (optional): Body/payload for POST, PATCH, etc. Passed as `payload` to the worker.
+**Parameters:**
+
+- **`cacheName`** (required): Cache key for storing and retrieving data. Multiple components using the same `cacheName` share the same cached value (see [Shared cacheName](#shared-cachename--multiple-subscribers)).
+- **`request`** (optional): When provided, the worker performs an API request and stores the result. When omitted, the hook only reads from cache.
+- **`data`** (optional): Request body/payload for POST, PATCH, etc.
 - **`runMode`**:
-  - **`"auto"`** (default): Sends the request (or get) as soon as the hook runs.
-  - **`"manual"`**: Does not send automatically; call `refetch()` to send.
-  - **`"once"`**: Sends once automatically; `refetch()` does not send again.
-- **`enabled`**: When `false`, no request is sent (useful for conditional fetching).
+  - **`"auto"`** (default): Sends the request (or cache read) immediately when the hook mounts.
+  - **`"manual"`**: Does not send automatically; call `refetch()` to trigger.
+  - **`"once"`**: Sends once automatically on mount; subsequent `refetch()` calls do nothing.
+- **`enabled`**: When `false`, no request is sent (useful for conditional fetching based on user state or other conditions).
 
 **Return value:**
 
-| Property      | Type                         | Description                                                                                                                                                                                                                            |
-| ------------- | ---------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `data`        | `T \| null`                  | Response body (JSON, text, or `ArrayBuffer` for binary).                                                                                                                                                                               |
-| `meta`        | `BinaryResponseMeta \| null` | For binary responses: `contentType`, `contentDisposition`.                                                                                                                                                                             |
-| `loading`     | `boolean`                    | `true` while a request is in flight.                                                                                                                                                                                                   |
-| `error`       | `string \| null`             | Error message from the worker when the request failed; `null` when there is no error. The worker always sends an `error` field (`{ message: string }`); the hook exposes the message string or `null`. See [Errors](#errors).          |
-| `refetch`     | `() => void`                 | Re-runs the same logical request as the current config (get when there is no `request`, set when there is). No-op when `runMode === "once"` and already run, or when `enabled === false`. See [Refetch semantics](#refetch-semantics). |
-| `deleteCache` | `() => void`                 | Tells the worker to delete the cache entry for this `cacheName`.                                                                                                                                                                       |
+| Property      | Type                         | Description                                                                                                                           |
+| ------------- | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `data`        | `T \| null`                  | Response body: JSON/text for `responseType: "json"`, `ArrayBuffer` for `responseType: "binary"`, `Blob` for `responseType: "stream"`. |
+| `meta`        | `BinaryResponseMeta \| null` | For binary and stream responses: `contentType`, `contentDisposition`.                                                                 |
+| `loading`     | `boolean`                    | `true` while a request is in flight.                                                                                                  |
+| `error`       | `string \| null`             | Error message when the request failed; `null` when there is no error. See [Errors](#errors).                                          |
+| `refetch`     | `() => void`                 | Re-runs the same logical request. See [Refetch semantics](#refetch-semantics).                                                        |
+| `deleteCache` | `() => void`                 | Tells the worker to delete the cache entry for this `cacheName`.                                                                      |
 
-### Request config (for `request`)
+### React Examples
 
-```ts
-interface RequestConfig {
-  url: string;
-  method: "GET" | "get" | "POST" | "post" | "PATCH" | "patch" | "DELETE" | "delete";
-  mode?: "cors" | "no-cors" | "navigate" | "same-origin";
-  headers?: Record<string, string>;
-  credentials?: "include" | "same-origin" | "omit";
-  responseType?: "json" | "binary" | "stream"; // default: json
-}
-```
-
-- Use **`responseType: "binary"`** when the response is binary (e.g. audio/video). The worker returns an `ArrayBuffer` and sets `meta.contentType` (and `contentDisposition`) so you can build a `Blob` for playback.
-
-### React examples (aligned with tests)
-
-**GET request, auto-run:**
+**GET request with automatic execution:**
 
 ```ts
-const { data, loading, refetch, deleteCache } = useApiWorker({
+const { data, loading, error, refetch, deleteCache } = useApiWorker({
   cacheName: "todos",
-  request: { url: "https://example.com/api", method: "GET" },
+  request: { url: "https://api.example.com/todos", method: "GET" },
   runMode: "auto",
 });
-// Request is sent immediately. data/loading update when the worker responds.
+
+// Request is sent immediately when component mounts
+// data/loading/error update when the worker responds
 ```
 
 **POST request with payload:**
 
 ```ts
-const { data, loading, refetch } = useApiWorker({
-  cacheName: "posts",
+const { data, loading, error, refetch } = useApiWorker({
+  cacheName: "create-post",
   request: {
     url: "https://api.restful-api.dev/objects",
     method: "POST",
     headers: { "Content-Type": "application/json" },
   },
-  data: { name: "Worker test object", data: { source: "app", env: "prod" } },
+  data: {
+    name: "My New Object",
+    data: { color: "blue", size: "large" },
+  },
   runMode: "auto",
 });
 ```
@@ -116,296 +467,204 @@ const { data, loading, refetch } = useApiWorker({
 **PATCH request:**
 
 ```ts
-const { data, refetch } = useApiWorker({
-  cacheName: "patch-item",
+const { data, loading, refetch } = useApiWorker({
+  cacheName: "update-item",
   request: {
-    url: "https://api.restful-api.dev/objects/6",
+    url: "https://api.example.com/items/123",
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
   },
-  data: { data: { price: 99, note: "updated" } },
+  data: { status: "completed", updatedAt: new Date().toISOString() },
   runMode: "auto",
 });
 ```
 
-**Manual run (lazy request):**
+**Manual execution (lazy loading):**
 
 ```ts
 const { data, loading, refetch } = useApiWorker({
-  cacheName: "cats",
-  request: { url: "https://api.thecatapi.com/v1/images/search?limit=10", method: "GET" },
+  cacheName: "user-profile",
+  request: {
+    url: "https://api.example.com/profile",
+    method: "GET",
+  },
   runMode: "manual",
 });
-// Call refetch() in an effect or on click to send the request.
-useEffect(() => {
+
+// Call refetch() when needed (e.g., on button click or in useEffect)
+const handleLoadProfile = () => {
   refetch();
-}, []);
+};
 ```
 
-**Run once (single auto-run, refetch does not re-send):**
+**Run once (single automatic execution):**
 
 ```ts
 const { data, refetch } = useApiWorker({
-  cacheName: "once-key",
-  request: { url: "https://example.com/api", method: "GET" },
+  cacheName: "init-data",
+  request: { url: "https://api.example.com/init", method: "GET" },
   runMode: "once",
 });
-// Request is sent once. Calling refetch() does not send again.
+// Request is sent once on mount. Calling refetch() does nothing.
 ```
 
-**Disabled (no request sent):**
+**Conditional fetching:**
 
 ```ts
-const { data } = useApiWorker({
-  cacheName: "disabled-key",
-  request: { url: "https://example.com/api", method: "GET" },
+const { data, loading } = useApiWorker({
+  cacheName: "protected-resource",
+  request: { url: "https://api.example.com/protected", method: "GET" },
   runMode: "auto",
-  enabled: false,
+  enabled: isAuthenticated, // Only fetch when user is authenticated
 });
-// No postMessage is sent to the worker.
 ```
 
-**Read from cache only (no request):**
+**Read from cache only (no API request):**
 
 ```ts
-const { data, loading, refetch } = useApiWorker({
-  cacheName: "cats",
+const { data, loading, error, refetch } = useApiWorker({
+  cacheName: "shared-state",
   runMode: "auto",
 });
-// Sends a "get" dataRequest; if cache is empty, worker responds with error.message e.g. "Cache miss".
+// Sends a "get" request to the worker
+// If cache is empty, error will be "Cache miss"
 ```
 
-**Binary response (e.g. audio/video):**
+**Binary response (complete file):**
 
 ```ts
-const { data, meta } = useApiWorker({
-  cacheName: "audio",
+const { data, meta, loading } = useApiWorker({
+  cacheName: "pdf-document",
   request: {
-    url: "https://httpbin.org/bytes/128",
+    url: "https://example.com/document.pdf",
     method: "GET",
     responseType: "binary",
   },
   runMode: "auto",
 });
-// data is ArrayBuffer; meta has contentType/contentDisposition for new Blob([data], { type: meta?.contentType }).
+
+// When loaded, data is ArrayBuffer
+// meta contains contentType and contentDisposition
+// Create a Blob: new Blob([data], { type: meta?.contentType })
+// Create object URL: URL.createObjectURL(blob)
+```
+
+**Streaming response (audio/video):**
+
+```ts
+const { data, meta, loading, error } = useApiWorker({
+  cacheName: "video-stream",
+  request: {
+    url: "https://example.com/video.mp4",
+    method: "GET",
+    responseType: "stream",
+    retries: 3, // Retry on connection loss (default 3, max 5)
+  },
+  runMode: "auto",
+});
+
+// data is a Blob when the stream completes
+// loading is true until stream ends
+// Use with media elements:
+// const videoUrl = data ? URL.createObjectURL(data) : null;
+// <video src={videoUrl} controls />
 ```
 
 **Delete cache:**
 
 ```ts
-const { deleteCache } = useApiWorker({
-  cacheName: "temp",
-  request: { url: "https://example.com/api", method: "GET" },
+const { data, deleteCache } = useApiWorker({
+  cacheName: "temporary-data",
+  request: { url: "https://api.example.com/temp", method: "GET" },
   runMode: "manual",
 });
-deleteCache(); // Sends delete dataRequest to the worker.
+
+const handleClearCache = () => {
+  deleteCache(); // Removes the cache entry from the worker
+};
 ```
 
-### Shared cacheName / multiple subscribers
+### Shared cacheName / Multiple Subscribers
 
-When multiple components use the same `cacheName`, they share one cache entry. Only one queue entry exists per normalized cache name; the last-mounted component’s `setUpdateTrigger` is the one that receives updates, so only that component re-renders when the worker responds. Prefer a unique `cacheName` per logical resource if you need independent loading/error state per component.
+When multiple components use the same `cacheName`, they share a single cache entry in the worker. However, only one queue entry exists per normalized cache name, and the last-mounted component's state updater receives the worker's responses. This means only that component will re-render when the worker responds.
 
-### Refetch semantics
+**Recommendation:** Use unique `cacheName` values per logical resource if you need independent `loading`/`error` state in each component.
 
-`refetch()` re-runs the same logical operation as the current config: a **get** when `request` is omitted (read from cache), or a **set** (API request or cache-only) when `request` is provided. It does not switch between get and set based on prior runs; it uses the current `cacheName`, `request`, and `data` at call time.
+### Refetch Semantics
+
+`refetch()` re-runs the same logical operation as the current hook configuration:
+
+- **When `request` is omitted**: Sends a **get** request (reads from cache)
+- **When `request` is provided**: Sends a **set** request (makes an API call or stores data)
+
+It does not switch between get and set based on prior runs; it uses the current `cacheName`, `request`, and `data` values at the time `refetch()` is called.
 
 ### Errors
 
-The worker always sends an `error` field on every message: `{ message: string }`. No error = `{ message: "" }`; when the request failed = `{ message: "..." }` (e.g. `"Cache miss"`, `"Invalid request: type is required"`, HTTP status text, or network/abort messages). The hook exposes this as `error: string | null` (the message string or `null` when `message` is empty). You can watch `error` in render or an effect to handle failures. Responses are routed to the requesting entry by `cacheName` or, when `cacheName` is missing, by `hookId`.
+The worker always includes an `error` field in every message: `{ message: string }`.
+
+- **No error**: `{ message: "" }` (empty string)
+- **Error occurred**: `{ message: "error description" }`
+
+The hook exposes this as `error: string | null`:
+
+- `null` when `error.message` is empty
+- The error message string when an error occurred
+
+Common error messages:
+
+- `"Cache miss"` – Requested cache key doesn't exist
+- `"Invalid request: ..."` – Request validation failed
+- HTTP status text or network error messages
+
+Responses are routed to the requesting component by `cacheName` or, when `cacheName` is missing from the worker response, by `hookId`.
 
 ---
 
-## Usage with Vanilla TypeScript / JavaScript
+## TypeScript Types
 
-Without React, you use the same Web Worker and message protocol. You create a Worker from the package’s built worker script, then send **dataRequests** via `postMessage` and handle responses in `onmessage`.
-
-### Worker script location
-
-- **Bundler (Vite, webpack, etc.):** Use the worker entry from the package. For example with Vite:
-  ```ts
-  const worker = new Worker(
-    new URL("node_modules/@mainframework/api-reqpuest-provider-worker-hook/dist/api.worker.js", import.meta.url),
-    { type: "module" },
-  );
-  ```
-  Or with a package that resolves the worker URL (e.g. `?worker` or `?url`), point that at the package’s `dist/api.worker.js`.
-- **No bundler:** Serve `node_modules/@mainframework/api-reqpuest-provider-worker-hook/dist/api.worker.js` and create the worker with that URL.
-
-### Message protocol
-
-**Outgoing (main thread → worker):**
-
-Send a single object: `{ dataRequest: { ... } }`.
-
-| dataRequest.type | Description                                         | Required fields | Optional                                    |
-| ---------------- | --------------------------------------------------- | --------------- | ------------------------------------------- |
-| `"get"`          | Return cached value for `cacheName`.                | `cacheName`     | `hookId`                                    |
-| `"set"`          | Store payload and/or run API request, then respond. | `cacheName`     | `hookId`, `request`, `payload`, `requestId` |
-| `"delete"`       | Remove cache entry for `cacheName`.                 | `cacheName`     | `hookId`                                    |
-| `"cancel"`       | Abort in-flight request by `requestId`.             | —               | `requestId`                                 |
-
-- **`cacheName`**: String; required for `get`, `set`, `delete`. Stored keys are normalized to lowercase.
-- **`request`**: Same shape as React’s `RequestConfig` (`url`, `method`, `headers`, `credentials`, `responseType`, etc.). Required for `set` when you want an API call; optional for cache-only set.
-- **`payload`**: Body for POST/PATCH; required for `set` when there is no `request`, and for non-GET requests when `request` is provided.
-- **`requestId`**: Optional for `set` (enables cancellation); required for `cancel`.
-
-**Incoming (worker → main thread):**
-
-Every message includes `error: { message: string }`. Success: `data` has the body and `error.message` is `""`. Failure: `data` is `null` and `error.message` is the error text.
-
-- **Success (JSON/text):** `{ cacheName, data, error: { message: "" }, hookId?, httpStatus? }`
-- **Success (binary):** `{ cacheName, data: ArrayBuffer, meta: { contentType?, contentDisposition }, error: { message: "" }, hookId?, httpStatus? }`
-- **Error:** `{ cacheName?, data: null, error: { message: "..." }, hookId? }`. When the request had no `cacheName` (e.g. validation before cacheName is set), `cacheName` may be empty; match by `hookId`.
-
-Example messages:
-
-- **Validation:** e.g. `"Invalid request: type is required"`, `"Invalid request: cacheName is required"`, `"Invalid request: payload is required for set"`, `"Invalid request: payload is required for non-GET API request"`.
-- **Cache miss:** `"Cache miss"` when `get` is sent for a key with no cached value.
-- **HTTP/network/abort:** status text or fetch error message.
-
-### Vanilla examples (aligned with api.worker tests)
-
-**GET from API and receive JSON:**
+**For React:**
 
 ```ts
-const worker = new Worker(workerUrl, { type: "module" });
-const cacheName = "api-get-" + Date.now();
-
-worker.onmessage = (event) => {
-  const { cacheName: name, data, error, httpStatus } = event.data;
-  if (name === cacheName && error?.message === "" && data != null) {
-    console.log("Response:", data, "status:", httpStatus);
-  }
-};
-
-worker.postMessage({
-  dataRequest: {
-    type: "set",
-    cacheName,
-    request: { url: "https://example.com/api", method: "GET" },
-    hookId: "h1",
-  },
-});
+import type { RequestConfig, UseApiWorkerConfig, UseApiWorkerReturn } from "@mainframework/api-request-worker";
 ```
 
-**POST with payload:**
+**For vanilla JavaScript/TypeScript:**
 
-```ts
-worker.postMessage({
-  dataRequest: {
-    type: "set",
-    cacheName: "api-post-" + Date.now(),
-    payload: { name: "test" },
-    request: {
-      url: "https://example.com/api",
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-    },
-    hookId: "h1",
-  },
-});
-```
-
-**Cache-only set, then get:**
-
-```ts
-const cacheName = "set-cache-only-" + Math.random();
-
-worker.postMessage({
-  dataRequest: { type: "set", cacheName, payload: { a: 1, b: 2 }, hookId: "h1" },
-});
-
-// After a tick, request the value back
-setTimeout(() => {
-  worker.postMessage({ dataRequest: { type: "get", cacheName } });
-}, 0);
-// onmessage will receive { cacheName, data: { a: 1, b: 2 } }
-```
-
-**Get when key is missing (CACHE_MISS):**
-
-```ts
-worker.postMessage({
-  dataRequest: { type: "get", cacheName: "nonexistent-key", hookId: "h1" },
-});
-// onmessage: { cacheName: "nonexistent-key", data: null, error: { message: "Cache miss" }, hookId: "h1" }
-```
-
-**Delete cache:**
-
-```ts
-worker.postMessage({ dataRequest: { type: "set", cacheName: "delete-key", payload: { keep: true } } });
-// then
-worker.postMessage({ dataRequest: { type: "delete", cacheName: "delete-key", hookId: "h1" } });
-// Response: { cacheName: "delete-key", data: { deleted: true }, error: { message: "" }, hookId: "h1" }
-// Subsequent get for same cacheName returns error: { message: "Cache miss" }.
-```
-
-**Binary response (e.g. GET bytes):**
-
-```ts
-worker.postMessage({
-  dataRequest: {
-    type: "set",
-    cacheName: "httpbin-bytes-" + Date.now(),
-    request: {
-      url: "https://httpbin.org/bytes/128",
-      method: "GET",
-      responseType: "binary",
-    },
-  },
-});
-// onmessage: data is ArrayBuffer, meta has contentType (e.g. application/octet-stream).
-// Build Blob: new Blob([event.data.data], { type: event.data.meta?.contentType ?? "application/octet-stream" })
-```
-
-**Cancel in-flight request:**
-
-```ts
-const requestId = "cancel-req-" + Date.now();
-worker.postMessage({
-  dataRequest: {
-    type: "set",
-    cacheName: "large-cancel",
-    request: { url: "https://httpbin.org/bytes/50000", method: "GET", responseType: "binary" },
-    requestId,
-  },
-});
-setTimeout(() => {
-  worker.postMessage({ dataRequest: { type: "cancel", requestId } });
-}, 100);
-```
-
-**Validation errors (missing type, cacheName, or payload):**
-
-- `{ type: "", cacheName: "x" }` → worker responds with `error: { message: "Invalid request: type is required" }`.
-- `{ type: "get" }` (no cacheName) → `error: { message: "Invalid request: cacheName is required" }`.
-- `{ type: "set", cacheName: "valid-key" }` (no payload, no request) → `error: { message: "Invalid request: payload is required for set" }`.
-- `{ type: "set", cacheName: "k", request: { url: "...", method: "POST" } }` (no payload) → `error: { message: "Invalid request: payload is required for non-GET API request" }`.
+The worker expects the `dataRequest` shape described in the protocol documentation above. You can define minimal types for message payloads or reuse `RequestConfig` for the `request` field.
 
 ---
 
-## Types (TypeScript)
+## Quick Reference
 
-When using React you can import:
-
-```ts
-import type {
-  RequestConfig,
-  UseApiWorkerConfig,
-  UseApiWorkerReturn,
-} from "@mainframework/api-reqpuest-provider-worker-hook";
-```
-
-For vanilla usage, the worker expects the `dataRequest` shape described above; you can define a minimal type for the message payload or reuse the same `RequestConfig` for the `request` field.
+| Use case          | Entry point                      | Primary API                                                                                                                                                |
+| ----------------- | -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Vanilla JS/TS** | Worker from `dist/api.worker.js` | `worker.postMessage({ dataRequest: { type, cacheName, request?, payload?, ... } })` and `worker.onmessage` for responses                                   |
+| **React**         | Optional: `useApiWorker` hook    | `useApiWorker({ cacheName, request?, data?, runMode?, enabled? })` → `{ data, meta, loading, error, refetch, deleteCache }` (or use worker protocol above) |
 
 ---
 
-## Summary
+## Framework Integrations
 
-| Use case          | Entry                            | Main API                                                                                                                    |
-| ----------------- | -------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| **React**         | `useApiWorker` from the package  | `useApiWorker({ cacheName, request?, data?, runMode?, enabled? })` → `{ data, meta, loading, error, refetch, deleteCache }` |
-| **Vanilla TS/JS** | Worker from `dist/api.worker.js` | `worker.postMessage({ dataRequest: { type: "get"\|"set"\|"delete"\|"cancel", ... } })` and `worker.onmessage` for responses |
+**Core:** The worker and message protocol work with any environment (vanilla JavaScript/TypeScript or any framework).
 
-The instructions and examples above mirror the behavior covered by the package’s React hook tests (`useApiWorker.test.ts`) and worker tests (`api.worker.test.ts`).
+**Optional integration:** A React hook (`useApiWorker`) is included to make adoption easier for React projects; React teams may instead integrate using the worker protocol directly.
+
+**Coming soon:** Idiomatic helpers for other frameworks (Angular, Vue, Preact, SolidJS) are planned; until then, use the protocol from those frameworks as with vanilla JS.
+
+---
+
+## Testing
+
+This library is thoroughly tested with comprehensive test suites:
+
+- React hook tests (`useApiWorker.test.ts`)
+- Worker protocol tests (`api.worker.test.ts`)
+
+Key behaviors and examples in this README are covered by the test suites.
+
+---
+
+## License
+
+See the License file in the repo
