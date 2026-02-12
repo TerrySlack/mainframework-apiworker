@@ -1,6 +1,6 @@
 {
   "name": "@mainframework/api-request-worker",
-  "version": "0.0.0",
+  "version": "1.0.0",
   "description": "Offloads API requests and application state to a Web Worker to keep the UI thread fast.",
   "type": "module",
   "main": "./dist/index.js",
