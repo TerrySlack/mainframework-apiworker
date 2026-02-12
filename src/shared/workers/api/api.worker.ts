@@ -35,6 +35,7 @@ const makeError = (
 /**
  * Binary response - transferred via postMessage, not stored in cache.
  * Client receives ArrayBuffer + meta for reconstruction (e.g. new Blob([data], { type })).
+ * Always sends a message; empty/zero-length body uses an empty ArrayBuffer so the client does not hang.
  */
 const callerResponseBinary = (
   cacheName: string,
@@ -43,8 +44,11 @@ const callerResponseBinary = (
   hookId?: string | null,
   httpStatus?: number,
 ): void => {
-  if (data) {
-    self.postMessage({ cacheName, data, meta, hookId, httpStatus }, [data]);
+  const buffer = data && data.byteLength > 0 ? data : new ArrayBuffer(0);
+  if (buffer === data) {
+    self.postMessage({ cacheName, data: buffer, meta, hookId, httpStatus }, [buffer]);
+  } else {
+    self.postMessage({ cacheName, data: buffer, meta, hookId, httpStatus });
   }
 };
 
@@ -127,6 +131,7 @@ const parseResponseByContentType = async (response: Response): Promise<unknown> 
   };
 };
 
+/** File/Blob use fileFieldName (default "Files"); all other fields use property name (key). */
 const appendToFormData = (
   formData: FormData,
   key: string,
@@ -134,14 +139,13 @@ const appendToFormData = (
   fileFieldName: string = DEFAULT_FILES_FIELD,
   visited?: WeakSet<object>,
 ): boolean => {
-  const formFieldName = key ? key : fileFieldName;
   if (value instanceof File) {
-    formData.append(formFieldName, value, value.name);
+    formData.append(fileFieldName, value, value.name);
     return true;
   }
 
   if (value instanceof Blob) {
-    formData.append(formFieldName, value, "blob");
+    formData.append(fileFieldName, value, "blob");
     return true;
   }
 
@@ -220,6 +224,9 @@ const buildJsonBody = (payload: unknown): BodyInit => JSON.stringify(payload);
 const buildUrlEncodedBody = (payload: Record<string, string>): BodyInit => new URLSearchParams(payload).toString();
 const buildTextBody = (payload: unknown): BodyInit => String(payload);
 
+/**
+ * Builds body and headers for fetch. Each branch handles one payload type; add new cases here for new body types.
+ */
 const prepareRequestBody = (
   payload: unknown,
   headers: Record<string, string>,
@@ -231,23 +238,18 @@ const prepareRequestBody = (
   switch (payloadType) {
     case "formdata":
       return { body: payload as FormData, headers: omitContentType(outHeaders()) };
-
     case "blob":
       return { body: payload as Blob, headers: outHeaders() };
-
     case "arraybuffer":
       return { body: payload as ArrayBuffer, headers: outHeaders() };
-
     case "arraybufferview":
       return { body: payload as BodyInit, headers: outHeaders() };
-
     case "stream":
       return { body: payload as ReadableStream<Uint8Array>, headers: outHeaders() };
-
     case "string":
       return { body: payload as string, headers: outHeaders() };
-
     case "object": {
+      /* Serialize by Content-Type: json, urlencoded, text, or multipart (with File/Blob). */
       const h = outHeaders();
       const contentType = getContentType(h);
       const fileFieldName = options?.formDataFileFieldName ?? DEFAULT_FILES_FIELD;
@@ -389,6 +391,7 @@ const apiRequest = async <TData>(
       }
     } catch (error) {
       if ((error as Error).name === "AbortError") {
+        callerResponse(cacheName, makeError("aborted", "Request aborted"), hookId);
         return;
       }
       const err = error as Error;
@@ -484,11 +487,11 @@ const onCancel = (requestId: string): void => {
 /**
  * Incoming messages from the main thread. Expects payload shape { dataRequest?: DataRequest }.
  * Dispatches to get/set/delete/cancel. Responses via postMessage: { cacheName, data?, meta?, hookId?, httpStatus? }.
- * Errors as data: { kind: "http"|"network"|"validation", message, status?, code? }.
+ * Errors are sent as data (WorkerError), not a separate error property: { kind, message, status?, code? }.
  */
-onmessage = (event: MessageEvent): void => {
-  const data = event.data as DataRequest;
-  if (data === null || typeof data !== "object") return;
-  const dataRequest = (data as WorkerMessageData).dataRequest;
+onmessage = (event: MessageEvent<WorkerMessageData>): void => {
+  const payload = event.data;
+  if (payload === null || typeof payload !== "object") return;
+  const dataRequest = payload.dataRequest;
   if (dataRequest !== undefined) onRequest(dataRequest);
 };

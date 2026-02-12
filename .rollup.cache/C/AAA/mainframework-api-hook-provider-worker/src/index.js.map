@@ -1,1 +1,0 @@
-{"version":3,"file":"index.js","sourceRoot":"","sources":["index.ts"],"names":[],"mappings":"AAAA,OAAO,EAAE,YAAY,EAAE,MAAM,6BAA6B,CAAC","sourcesContent":["export { useApiWorker } from \"./shared/hooks/useApiWorker\";\r\nexport type { RequestConfig, UseApiWorkerConfig, UseApiWorkerReturn } from \"./shared/hooks/useApiWorker\";\r\n"]}

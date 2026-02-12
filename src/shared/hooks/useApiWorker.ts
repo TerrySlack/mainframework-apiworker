@@ -6,6 +6,7 @@ import type {
   QueueEntry,
   UseApiWorkerConfig,
   UseApiWorkerReturn,
+  WorkerErrorKind,
   WorkerMessagePayload,
 } from "../types/types";
 import { useCustomCallback } from "./useCustomCallback";
@@ -51,13 +52,13 @@ const responseQueue: Record<string, QueueEntry<unknown>> = {};
 
 const updater = (n: number) => n + 1;
 
-const ERROR_KINDS = ["http", "network", "validation"] as const;
+const ERROR_KINDS: readonly WorkerErrorKind[] = ["http", "network", "validation", "aborted"];
 const isWorkerErrorPayload = (d: unknown): d is { kind: string; message: string; status?: number; code?: string } =>
   !!d &&
   typeof d === "object" &&
   "kind" in d &&
   typeof (d as { kind: unknown }).kind === "string" &&
-  ERROR_KINDS.includes((d as { kind: string }).kind as (typeof ERROR_KINDS)[number]) &&
+  ERROR_KINDS.includes((d as { kind: string }).kind as WorkerErrorKind) &&
   "message" in d &&
   typeof (d as { message: unknown }).message === "string";
 
@@ -88,7 +89,7 @@ apiWorker.onmessage = (event: MessageEvent<WorkerMessagePayload>) => {
           : "Unknown error";
     entry.error = isWorkerErrorPayload(errorPayload)
       ? {
-          kind: errorPayload.kind as "http" | "network" | "validation",
+          kind: errorPayload.kind as WorkerErrorKind,
           message,
           ...(errorPayload.status !== undefined && { status: errorPayload.status }),
           ...(errorPayload.code !== undefined && { code: errorPayload.code }),

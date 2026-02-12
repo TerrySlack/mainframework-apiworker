@@ -57,7 +57,7 @@ export type BinaryParseResult = {
   contentType: string;
 } & Pick<BinaryResponseMeta, "contentDisposition">;
 
-export type WorkerErrorKind = "http" | "network" | "validation";
+export type WorkerErrorKind = "http" | "network" | "validation" | "aborted";
 
 export interface WorkerError {
   kind: WorkerErrorKind;
@@ -102,11 +102,12 @@ export type WorkerResponseMessage =
 
 /**
  * Payload shape for worker postMessage. Use for client onmessage:
- * MessageEvent<WorkerMessagePayload>. Success: data = body. Error: data = WorkerError (kind, message, status?, code?).
+ * MessageEvent<WorkerMessagePayload>. Success: data = body.
+ * Errors are sent as data (WorkerError), not as a separate error property: data = WorkerError (kind, message, status?, code?).
  */
 export interface WorkerMessagePayload {
   cacheName?: string;
-  /** Response body or error payload (WorkerError when kind is "http"|"network"|"validation"). */
+  /** Response body or error payload (WorkerError when kind is "http"|"network"|"validation"|"aborted"). */
   data?: unknown;
   meta?: BinaryResponseMeta;
   error?: WorkerError;
