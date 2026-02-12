@@ -57,13 +57,9 @@ export type BinaryParseResult = {
   contentType: string;
 } & Pick<BinaryResponseMeta, "contentDisposition">;
 
-export type WorkerErrorKind = "http" | "network" | "validation" | "aborted";
-
-export interface WorkerError {
-  kind: WorkerErrorKind;
+/** Worker always sends this shape; no error = { message: "" }. */
+export interface WorkerErrorPayload {
   message: string;
-  status?: number;
-  code?: string;
 }
 
 export interface QueueEntry<T> {
@@ -72,7 +68,7 @@ export interface QueueEntry<T> {
   loading: boolean | null;
   data: T | null;
   meta: BinaryResponseMeta | null;
-  error: WorkerError | null;
+  error: string | null;
   setUpdateTrigger: Dispatch<SetStateAction<number>> | null;
   requestId: string | null;
   lastActivityAt: number | null;
@@ -82,7 +78,7 @@ export interface UseApiWorkerReturn<T> {
   data: T | null;
   meta: BinaryResponseMeta | null;
   loading: boolean;
-  error: WorkerError | null;
+  error: string | null;
   refetch: () => void;
   deleteCache: () => void;
 }
@@ -96,21 +92,21 @@ export type AbortControllers = Map<string, AbortController>;
  * - error: error response with message and code
  */
 export type WorkerResponseMessage =
-  | { cacheName: string; data: unknown }
-  | { cacheName: string; data: ArrayBuffer; meta: BinaryResponseMeta }
-  | { cacheName: string; error: WorkerError };
+  | { cacheName: string; data: unknown; error: WorkerErrorPayload }
+  | { cacheName: string; data: ArrayBuffer; meta: BinaryResponseMeta; error: WorkerErrorPayload }
+  | { cacheName: string; error: WorkerErrorPayload };
 
 /**
  * Payload shape for worker postMessage. Use for client onmessage:
- * MessageEvent<WorkerMessagePayload>. Success: data = body.
- * Errors are sent as data (WorkerError), not as a separate error property: data = WorkerError (kind, message, status?, code?).
+ * MessageEvent<WorkerMessagePayload>. The worker always sends error (same shape: { message: string }).
+ * No error = { message: "" }. With error = { message: "..." }.
  */
 export interface WorkerMessagePayload {
   cacheName?: string;
-  /** Response body or error payload (WorkerError when kind is "http"|"network"|"validation"|"aborted"). */
   data?: unknown;
   meta?: BinaryResponseMeta;
-  error?: WorkerError;
+  /** Always present: { message: "" } when no error, { message: "..." } when failed. */
+  error: WorkerErrorPayload;
   hookId?: string;
   httpStatus?: number;
 }

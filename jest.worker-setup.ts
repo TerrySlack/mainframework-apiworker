@@ -34,7 +34,7 @@ const realWorkerAdapter = {
 nodeWorker.on("message", (payload: { msg?: unknown; error?: string }) => {
   if (!onmessageHandler) return;
   const event = payload.error
-    ? ({ data: { cacheName: "error", data: { kind: "validation" as const, message: payload.error } } } as MessageEvent)
+    ? ({ data: { cacheName: "error", data: null, error: { message: payload.error } } } as MessageEvent)
     : ({ data: payload.msg } as MessageEvent);
   act(() => {
     onmessageHandler!(event);

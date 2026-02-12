@@ -50,7 +50,7 @@ const result = useApiWorker({
 // result: { data, meta, loading, error, refetch, deleteCache }
 ```
 
-- **`cacheName`** (required): Key used to store and retrieve data. Same cache name in different components shares the same cached value.
+- **`cacheName`** (required): Key used to store and retrieve data. Same cache name in different components shares the same cached value (see [Shared cacheName](#shared-cachename--multiple-subscribers)).
 - **`request`** (optional): When provided, the worker performs an API request and stores the result under `cacheName`. When omitted, the worker only reads from cache (or returns cache miss).
 - **`data`** (optional): Body/payload for POST, PATCH, etc. Passed as `payload` to the worker.
 - **`runMode`**:
@@ -61,14 +61,14 @@ const result = useApiWorker({
 
 **Return value:**
 
-| Property      | Type                                                   | Description                                                                                                  |
-| ------------- | ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------ |
-| `data`        | `T \| null`                                            | Response body (JSON, text, or `ArrayBuffer` for binary).                                                     |
-| `meta`        | `BinaryResponseMeta \| null`                           | For binary responses: `contentType`, `contentDisposition`.                                                   |
-| `loading`     | `boolean`                                              | `true` while a request is in flight.                                                                         |
-| `error`       | `{ message: string; code?: string \| number } \| null` | Set when the worker returns an error.                                                                        |
-| `refetch`     | `() => void`                                           | Triggers the request (or get). No-op when `runMode === "once"` and already run, or when `enabled === false`. |
-| `deleteCache` | `() => void`                                           | Tells the worker to delete the cache entry for this `cacheName`.                                             |
+| Property      | Type                         | Description                                                                                                                                                                                                                            |
+| ------------- | ---------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `data`        | `T \| null`                  | Response body (JSON, text, or `ArrayBuffer` for binary).                                                                                                                                                                               |
+| `meta`        | `BinaryResponseMeta \| null` | For binary responses: `contentType`, `contentDisposition`.                                                                                                                                                                             |
+| `loading`     | `boolean`                    | `true` while a request is in flight.                                                                                                                                                                                                   |
+| `error`       | `string \| null`             | Error message from the worker when the request failed; `null` when there is no error. The worker always sends an `error` field (`{ message: string }`); the hook exposes the message string or `null`. See [Errors](#errors).          |
+| `refetch`     | `() => void`                 | Re-runs the same logical request as the current config (get when there is no `request`, set when there is). No-op when `runMode === "once"` and already run, or when `enabled === false`. See [Refetch semantics](#refetch-semantics). |
+| `deleteCache` | `() => void`                 | Tells the worker to delete the cache entry for this `cacheName`.                                                                                                                                                                       |
 
 ### Request config (for `request`)
 
@@ -172,7 +172,7 @@ const { data, loading, refetch } = useApiWorker({
   cacheName: "cats",
   runMode: "auto",
 });
-// Sends a "get" dataRequest; if cache is empty, worker responds with CACHE_MISS (error).
+// Sends a "get" dataRequest; if cache is empty, worker responds with error.message e.g. "Cache miss".
 ```
 
 **Binary response (e.g. audio/video):**
@@ -200,6 +200,18 @@ const { deleteCache } = useApiWorker({
 });
 deleteCache(); // Sends delete dataRequest to the worker.
 ```
+
+### Shared cacheName / multiple subscribers
+
+When multiple components use the same `cacheName`, they share one cache entry. Only one queue entry exists per normalized cache name; the last-mounted component’s `setUpdateTrigger` is the one that receives updates, so only that component re-renders when the worker responds. Prefer a unique `cacheName` per logical resource if you need independent loading/error state per component.
+
+### Refetch semantics
+
+`refetch()` re-runs the same logical operation as the current config: a **get** when `request` is omitted (read from cache), or a **set** (API request or cache-only) when `request` is provided. It does not switch between get and set based on prior runs; it uses the current `cacheName`, `request`, and `data` at call time.
+
+### Errors
+
+The worker always sends an `error` field on every message: `{ message: string }`. No error = `{ message: "" }`; when the request failed = `{ message: "..." }` (e.g. `"Cache miss"`, `"Invalid request: type is required"`, HTTP status text, or network/abort messages). The hook exposes this as `error: string | null` (the message string or `null` when `message` is empty). You can watch `error` in render or an effect to handle failures. Responses are routed to the requesting entry by `cacheName` or, when `cacheName` is missing, by `hookId`.
 
 ---
 
@@ -239,16 +251,17 @@ Send a single object: `{ dataRequest: { ... } }`.
 
 **Incoming (worker → main thread):**
 
-Each message has one of these shapes (aligned with tests):
+Every message includes `error: { message: string }`. Success: `data` has the body and `error.message` is `""`. Failure: `data` is `null` and `error.message` is the error text.
 
-- **Success (JSON/text):** `{ cacheName, data, hookId?, httpStatus? }`
-- **Success (binary):** `{ cacheName, data: ArrayBuffer, meta: { contentType?, contentDisposition }, hookId?, httpStatus? }`
-- **Error:** `{ cacheName: "error" | yourCacheName, data: { error, code? }, hookId? }` or top-level `error` and optional `data.code`.
+- **Success (JSON/text):** `{ cacheName, data, error: { message: "" }, hookId?, httpStatus? }`
+- **Success (binary):** `{ cacheName, data: ArrayBuffer, meta: { contentType?, contentDisposition }, error: { message: "" }, hookId?, httpStatus? }`
+- **Error:** `{ cacheName?, data: null, error: { message: "..." }, hookId? }`. When the request had no `cacheName` (e.g. validation before cacheName is set), `cacheName` may be empty; match by `hookId`.
 
-Special errors:
+Example messages:
 
-- **`INVALID_REQUEST`**: Missing or invalid `type`, `cacheName`, or `payload` (e.g. payload required for set without request, or for non-GET with request).
-- **`CACHE_MISS`**: `get` was sent for a key that has no cached value.
+- **Validation:** e.g. `"Invalid request: type is required"`, `"Invalid request: cacheName is required"`, `"Invalid request: payload is required for set"`, `"Invalid request: payload is required for non-GET API request"`.
+- **Cache miss:** `"Cache miss"` when `get` is sent for a key with no cached value.
+- **HTTP/network/abort:** status text or fetch error message.
 
 ### Vanilla examples (aligned with api.worker tests)
 
@@ -259,8 +272,8 @@ const worker = new Worker(workerUrl, { type: "module" });
 const cacheName = "api-get-" + Date.now();
 
 worker.onmessage = (event) => {
-  const { cacheName: name, data, httpStatus } = event.data;
-  if (name === cacheName && data && !event.data.error) {
+  const { cacheName: name, data, error, httpStatus } = event.data;
+  if (name === cacheName && error?.message === "" && data != null) {
     console.log("Response:", data, "status:", httpStatus);
   }
 };
@@ -315,7 +328,7 @@ setTimeout(() => {
 worker.postMessage({
   dataRequest: { type: "get", cacheName: "nonexistent-key", hookId: "h1" },
 });
-// onmessage: { cacheName: "nonexistent-key", data: { error: "Cache miss", code: "CACHE_MISS" }, hookId: "h1" }
+// onmessage: { cacheName: "nonexistent-key", data: null, error: { message: "Cache miss" }, hookId: "h1" }
 ```
 
 **Delete cache:**
@@ -324,8 +337,8 @@ worker.postMessage({
 worker.postMessage({ dataRequest: { type: "set", cacheName: "delete-key", payload: { keep: true } } });
 // then
 worker.postMessage({ dataRequest: { type: "delete", cacheName: "delete-key", hookId: "h1" } });
-// Response: { cacheName: "delete-key", data: { deleted: true }, hookId: "h1" }
-// Subsequent get for same cacheName returns CACHE_MISS.
+// Response: { cacheName: "delete-key", data: { deleted: true }, error: { message: "" }, hookId: "h1" }
+// Subsequent get for same cacheName returns error: { message: "Cache miss" }.
 ```
 
 **Binary response (e.g. GET bytes):**
@@ -365,10 +378,10 @@ setTimeout(() => {
 
 **Validation errors (missing type, cacheName, or payload):**
 
-- `{ type: "", cacheName: "x" }` → worker responds with `INVALID_REQUEST` (type required).
-- `{ type: "get" }` (no cacheName) → `INVALID_REQUEST`, cacheName required.
-- `{ type: "set", cacheName: "valid-key" }` (no payload, no request) → `INVALID_REQUEST`, payload required for set.
-- `{ type: "set", cacheName: "k", request: { url: "...", method: "POST" } }` (no payload) → `INVALID_REQUEST`, payload required for non-GET.
+- `{ type: "", cacheName: "x" }` → worker responds with `error: { message: "Invalid request: type is required" }`.
+- `{ type: "get" }` (no cacheName) → `error: { message: "Invalid request: cacheName is required" }`.
+- `{ type: "set", cacheName: "valid-key" }` (no payload, no request) → `error: { message: "Invalid request: payload is required for set" }`.
+- `{ type: "set", cacheName: "k", request: { url: "...", method: "POST" } }` (no payload) → `error: { message: "Invalid request: payload is required for non-GET API request" }`.
 
 ---
 

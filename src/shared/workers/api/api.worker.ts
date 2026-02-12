@@ -6,31 +6,33 @@ import type {
   BinaryResponseMeta,
   DataRequest,
   WorkerApiRequest,
-  WorkerErrorKind,
+  WorkerErrorPayload,
   WorkerMessageData,
 } from "../../types/types";
 
 export const BINARY_MARKER = Symbol.for("WorkerApiBinary");
 
-const CODE_CACHE_MISS = "CACHE_MISS";
-const CODE_INVALID_REQUEST = "INVALID_REQUEST";
-const CODE_NETWORK_ERROR = "NETWORK_ERROR";
-const CODE_UNKNOWN = "UNKNOWN";
 const DEFAULT_FILES_FIELD = "Files";
 
-const callerResponse = <T>(cacheName: string, data: T, hookId?: string | null, httpStatus?: number): void => {
-  self.postMessage({ cacheName, data: data ?? null, hookId, httpStatus });
+const NO_ERROR: WorkerErrorPayload = { message: "" };
+
+const callerResponse = (
+  cacheName: string,
+  data: unknown,
+  hookId?: string | null,
+  httpStatus?: number,
+  error: WorkerErrorPayload = NO_ERROR,
+): void => {
+  self.postMessage({
+    cacheName,
+    data: error.message !== "" ? null : (data ?? null),
+    hookId,
+    httpStatus,
+    error,
+  });
 };
 
-const makeError = (
-  kind: WorkerErrorKind,
-  message: string,
-  opts?: { status?: number; code?: string },
-): { kind: WorkerErrorKind; message: string; status?: number; code?: string } => ({
-  kind,
-  message,
-  ...opts,
-});
+const makeError = (message: string): WorkerErrorPayload => ({ message });
 
 /**
  * Binary response - transferred via postMessage, not stored in cache.
@@ -43,12 +45,14 @@ const callerResponseBinary = (
   meta: BinaryResponseMeta,
   hookId?: string | null,
   httpStatus?: number,
+  error: WorkerErrorPayload = NO_ERROR,
 ): void => {
   const buffer = data && data.byteLength > 0 ? data : new ArrayBuffer(0);
+  const payload = { cacheName, data: buffer, meta, hookId, httpStatus, error };
   if (buffer === data) {
-    self.postMessage({ cacheName, data: buffer, meta, hookId, httpStatus }, [buffer]);
+    self.postMessage(payload, [buffer]);
   } else {
-    self.postMessage({ cacheName, data: buffer, meta, hookId, httpStatus });
+    self.postMessage(payload);
   }
 };
 
@@ -86,11 +90,7 @@ const commit = <TData>(cacheName: string, data: TData, hookId?: string | null, h
     return;
   }
 
-  callerResponse(
-    "error",
-    makeError("validation", "Invalid commit: cacheName is required", { code: CODE_INVALID_REQUEST }),
-    hookId,
-  );
+  callerResponse("", null, hookId, undefined, makeError("Invalid commit: cacheName is required"));
 };
 
 /**
@@ -358,12 +358,7 @@ const apiRequest = async <TData>(
       const response = await fetch(url, fetchOptions);
 
       if (response.status >= 400) {
-        callerResponse(
-          cacheName,
-          makeError("http", response.statusText, { status: response.status, code: String(response.status) }),
-          hookId,
-          response.status,
-        );
+        callerResponse(cacheName, null, hookId, response.status, makeError(response.statusText));
         return;
       }
 
@@ -391,12 +386,11 @@ const apiRequest = async <TData>(
       }
     } catch (error) {
       if ((error as Error).name === "AbortError") {
-        callerResponse(cacheName, makeError("aborted", "Request aborted"), hookId);
+        callerResponse(cacheName, null, hookId, undefined, makeError("Request aborted"));
         return;
       }
       const err = error as Error;
-      const code = err.name === "TypeError" ? CODE_NETWORK_ERROR : CODE_UNKNOWN;
-      callerResponse(cacheName, makeError("network", err.message, { code }), hookId);
+      callerResponse(cacheName, null, hookId, undefined, makeError(err.message));
     } finally {
       if (timeoutId != null) clearTimeout(timeoutId);
       if (requestId) {
@@ -412,13 +406,10 @@ const apiRequest = async <TData>(
 
 const onRequest = <TData>(dataRequest: DataRequest<TData>): void => {
   const { cacheName, type, payload, request, requestId, hookId } = dataRequest;
+  const responseCacheName = dataRequest.cacheName ?? "";
 
   if (!isNonEmptyString(type)) {
-    callerResponse(
-      "error",
-      makeError("validation", "Invalid request: type is required", { code: CODE_INVALID_REQUEST }),
-      hookId,
-    );
+    callerResponse(responseCacheName, null, hookId, undefined, makeError("Invalid request: type is required"));
     return;
   }
   const lowerType = normalizeKey(type);
@@ -429,11 +420,7 @@ const onRequest = <TData>(dataRequest: DataRequest<TData>): void => {
   }
 
   if (!isNonEmptyString(cacheName)) {
-    callerResponse(
-      "error",
-      makeError("validation", "Invalid request: cacheName is required", { code: CODE_INVALID_REQUEST }),
-      hookId,
-    );
+    callerResponse(responseCacheName, null, hookId, undefined, makeError("Invalid request: cacheName is required"));
     return;
   }
   const lowerCacheName = normalizeKey(cacheName);
@@ -441,7 +428,7 @@ const onRequest = <TData>(dataRequest: DataRequest<TData>): void => {
   if (lowerType === "get") {
     const requestedData = get(lowerCacheName);
     if (requestedData === undefined) {
-      callerResponse(lowerCacheName, makeError("validation", "Cache miss", { code: CODE_CACHE_MISS }), hookId);
+      callerResponse(lowerCacheName, null, hookId, undefined, makeError("Cache miss"));
     } else {
       callerResponse(lowerCacheName, requestedData, hookId);
     }
@@ -449,9 +436,11 @@ const onRequest = <TData>(dataRequest: DataRequest<TData>): void => {
     if (!request) {
       if (payload == null) {
         callerResponse(
-          "error",
-          makeError("validation", "Invalid request: payload is required for set", { code: CODE_INVALID_REQUEST }),
+          responseCacheName,
+          null,
           hookId,
+          undefined,
+          makeError("Invalid request: payload is required for set"),
         );
         return;
       }
@@ -460,11 +449,11 @@ const onRequest = <TData>(dataRequest: DataRequest<TData>): void => {
       const methodLower = normalizeKey(request.method);
       if (methodLower !== "get" && payload == null) {
         callerResponse(
-          "error",
-          makeError("validation", "Invalid request: payload is required for non-GET API request", {
-            code: CODE_INVALID_REQUEST,
-          }),
+          responseCacheName,
+          null,
           hookId,
+          undefined,
+          makeError("Invalid request: payload is required for non-GET API request"),
         );
         return;
       }
@@ -486,8 +475,8 @@ const onCancel = (requestId: string): void => {
 
 /**
  * Incoming messages from the main thread. Expects payload shape { dataRequest?: DataRequest }.
- * Dispatches to get/set/delete/cancel. Responses via postMessage: { cacheName, data?, meta?, hookId?, httpStatus? }.
- * Errors are sent as data (WorkerError), not a separate error property: { kind, message, status?, code? }.
+ * Responses via postMessage: { cacheName, data?, meta?, hookId?, httpStatus?, error }.
+ * error is always present: { message: "" } when no error, { message: "..." } when the request failed.
  */
 onmessage = (event: MessageEvent<WorkerMessageData>): void => {
   const payload = event.data;

@@ -155,7 +155,7 @@ describe("useApiWorker", () => {
         { timeout: WAIT_MS },
       );
       expect(result.current.error).not.toBeNull();
-      expect(result.current.error?.code).toBe("CACHE_MISS");
+      expect(result.current.error).toBe("Cache miss");
     });
   });
 

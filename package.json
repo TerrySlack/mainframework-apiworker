@@ -30,7 +30,8 @@
     "build": "yarn prebuild && rollup -c && tsc -p tsconfig.build.json",
     "test": "jest -c jestconfig.json --runInBand",
     "test:watch": "jest -c jestconfig.json --watchAll --runInBand",
-    "test:coverage": "jest -c jestconfig.json --coverage --runInBand"
+    "test:coverage": "jest -c jestconfig.json --coverage --runInBand",
+    "tscheck": "tsc"
   },
   "lint-staged": {
     "*.{js,jsx,ts,tsx}": [

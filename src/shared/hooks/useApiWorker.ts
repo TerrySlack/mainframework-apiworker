@@ -6,7 +6,6 @@ import type {
   QueueEntry,
   UseApiWorkerConfig,
   UseApiWorkerReturn,
-  WorkerErrorKind,
   WorkerMessagePayload,
 } from "../types/types";
 import { useCustomCallback } from "./useCustomCallback";
@@ -20,7 +19,7 @@ const apiWorker = new Worker(new URL("../workers/api/api.worker", import.meta.ur
 const STALE_ENTRY_MS = 5000;
 const CLEANUP_INTERVAL_MS = 30000;
 
-const normalizeKey = (key: string) => key.toLowerCase();
+const normalizeKey = (key: string) => key.toLocaleLowerCase();
 
 const cleanupState = { isDeleting: false, lastRun: 0 };
 
@@ -52,55 +51,20 @@ const responseQueue: Record<string, QueueEntry<unknown>> = {};
 
 const updater = (n: number) => n + 1;
 
-const ERROR_KINDS: readonly WorkerErrorKind[] = ["http", "network", "validation", "aborted"];
-const isWorkerErrorPayload = (d: unknown): d is { kind: string; message: string; status?: number; code?: string } =>
-  !!d &&
-  typeof d === "object" &&
-  "kind" in d &&
-  typeof (d as { kind: unknown }).kind === "string" &&
-  ERROR_KINDS.includes((d as { kind: string }).kind as WorkerErrorKind) &&
-  "message" in d &&
-  typeof (d as { message: unknown }).message === "string";
-
-// Worker message handler
+// Worker always sends error ({ message: string }). Entry is found by cacheName or hookId.
 apiWorker.onmessage = (event: MessageEvent<WorkerMessagePayload>) => {
-  const { data, cacheName, meta } = event.data;
-  const errorPayload = isWorkerErrorPayload(event.data.data)
-    ? event.data.data
-    : (event.data.error ??
-      (event.data.data && typeof event.data.data === "object" && "error" in event.data.data
-        ? (event.data.data as { error: unknown }).error
-        : null));
+  const { data, cacheName, meta, hookId, error } = event.data;
 
-  if (!cacheName) return;
-  const entry = responseQueue[normalizeKey(cacheName)];
+  const entry = cacheName
+    ? responseQueue[normalizeKey(cacheName)]
+    : hookId
+      ? (Object.values(responseQueue).find((e) => e.hookId === hookId) ?? null)
+      : null;
   if (!entry) return;
-  if (cacheName !== "error" && normalizeKey(entry.cacheName) !== normalizeKey(cacheName)) return;
 
-  if (errorPayload) {
-    const message =
-      typeof errorPayload === "string"
-        ? errorPayload
-        : typeof errorPayload === "object" &&
-            errorPayload !== null &&
-            "message" in errorPayload &&
-            typeof (errorPayload as { message: unknown }).message === "string"
-          ? (errorPayload as { message: string }).message
-          : "Unknown error";
-    entry.error = isWorkerErrorPayload(errorPayload)
-      ? {
-          kind: errorPayload.kind as WorkerErrorKind,
-          message,
-          ...(errorPayload.status !== undefined && { status: errorPayload.status }),
-          ...(errorPayload.code !== undefined && { code: errorPayload.code }),
-        }
-      : {
-          kind: "validation" as const,
-          message,
-          ...((event.data.data as { code?: string } | undefined)?.code !== undefined && {
-            code: (event.data.data as { code?: string }).code,
-          }),
-        };
+  const message = error?.message ?? "";
+  if (message !== "") {
+    entry.error = message;
     entry.loading = false;
   } else {
     entry.data = data;
@@ -156,10 +120,10 @@ export const useApiWorker = <T>(config: UseApiWorkerConfig): UseApiWorkerReturn<
   const deleteCache = useCallback(() => {
     if (cacheName) {
       apiWorker.postMessage({
-        dataRequest: { type: "delete", cacheName, hookId },
+        dataRequest: { type: "delete", cacheName, hookId: hookIdRef.current },
       });
     }
-  }, [cacheName, hookId]);
+  }, [cacheName]);
 
   useEffect(() => {
     runStaleEntryCleanup();
@@ -189,7 +153,7 @@ export const useApiWorker = <T>(config: UseApiWorkerConfig): UseApiWorkerReturn<
 
     apiWorker.postMessage({ dataRequest });
     hasExecutedRef.current = true;
-  }, [hookId, queueKey, cacheName, requestConfig, configData, runMode, enabled, setUpdateTrigger]);
+  }, [hookId, queueKey, cacheName, requestConfig, configData, runMode, enabled]);
 
   const shouldRun = (runMode === "auto" || runMode === "once") && enabled && (requestConfig || cacheName);
   if (shouldRun && !(runMode === "once" && hasExecutedRef.current) && !storeEntry.loading) {
