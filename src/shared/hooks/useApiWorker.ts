@@ -2,12 +2,15 @@
 import { useRef, useState, useCallback, useEffect } from "react";
 import { uniqueId } from "../utils/uniqueId";
 import type {
+  BinaryResponseMeta,
   DataRequest,
   QueueEntry,
   UseApiWorkerConfig,
   UseApiWorkerReturn,
   WorkerMessagePayload,
 } from "../types/types";
+
+type StreamAccumulator = { chunks: ArrayBuffer[]; meta: BinaryResponseMeta | null };
 import { useCustomCallback } from "./useCustomCallback";
 
 // ============================================================================
@@ -28,11 +31,12 @@ const runStaleEntryCleanup = (): void => {
   if (cleanupState.isDeleting || now < cleanupState.lastRun + CLEANUP_INTERVAL_MS) return;
   cleanupState.isDeleting = true;
   try {
-    for (const key of Object.keys(responseQueue)) {
+    const keys = Object.keys(responseQueue);
+    let i = 0;
+    while (i < keys.length) {
+      const key = keys[i] as string;
       const entry = responseQueue[key];
-      if (!entry) continue;
-
-      if (entry.data != null && entry.lastActivityAt != null && now - entry.lastActivityAt >= STALE_ENTRY_MS) {
+      if (entry && entry.data != null && entry.lastActivityAt != null && now - entry.lastActivityAt >= STALE_ENTRY_MS) {
         entry.loading = null;
         entry.data = null;
         entry.meta = null;
@@ -40,6 +44,7 @@ const runStaleEntryCleanup = (): void => {
         entry.setUpdateTrigger = null;
         entry.requestId = null;
       }
+      i++;
     }
   } finally {
     cleanupState.isDeleting = false;
@@ -49,17 +54,67 @@ const runStaleEntryCleanup = (): void => {
 
 const responseQueue: Record<string, QueueEntry<unknown>> = {};
 
+const streamAccumulators: Record<string, StreamAccumulator> = {};
+
 const updater = (n: number) => n + 1;
 
-// Worker always sends error ({ message: string }). Entry is found by cacheName or hookId.
-apiWorker.onmessage = (event: MessageEvent<WorkerMessagePayload>) => {
-  const { data, cacheName, meta, hookId, error } = event.data;
-
-  const entry = cacheName
+const findEntry = (cacheName: string | undefined, hookId: string | undefined) =>
+  cacheName
     ? responseQueue[normalizeKey(cacheName)]
     : hookId
       ? (Object.values(responseQueue).find((e) => e.hookId === hookId) ?? null)
       : null;
+
+const finalizeEntry = (entry: QueueEntry<unknown>): void => {
+  entry.requestId = null;
+  entry.setUpdateTrigger?.(updater);
+};
+
+// Worker always sends error ({ message: string }). Entry is found by cacheName or hookId.
+// Stream responses: start → chunk(s) → end; we accumulate chunks then set data = new Blob(chunks) on end.
+apiWorker.onmessage = (event: MessageEvent<WorkerMessagePayload>) => {
+  const msg = event.data;
+  const cacheName = msg.cacheName;
+  const hookId = msg.hookId;
+  const error = msg.error;
+  const key = cacheName ? normalizeKey(cacheName) : "";
+
+  if ("stream" in msg && msg.stream) {
+    const entry = findEntry(cacheName, hookId);
+    if (!entry) return;
+    switch (msg.stream) {
+      case "start":
+        streamAccumulators[key] = { chunks: [], meta: msg.meta ?? null };
+        return;
+      case "resume":
+        if (!streamAccumulators[key]) streamAccumulators[key] = { chunks: [], meta: msg.meta ?? null };
+        else if (msg.meta) streamAccumulators[key].meta = msg.meta;
+        return;
+      case "chunk": {
+        const acc = streamAccumulators[key];
+        if (acc && msg.data) acc.chunks.push(msg.data);
+        return;
+      }
+      case "end": {
+        const acc = streamAccumulators[key];
+        delete streamAccumulators[key];
+        const errMsg = error?.message ?? "";
+        if (errMsg !== "") {
+          entry.error = errMsg;
+        } else if (acc) {
+          entry.data = new Blob(acc.chunks, acc.meta?.contentType ? { type: acc.meta.contentType } : undefined);
+          entry.meta = acc.meta ?? null;
+          entry.error = null;
+          entry.lastActivityAt = Date.now();
+        }
+        entry.loading = false;
+        finalizeEntry(entry);
+        return;
+      }
+    }
+  }
+
+  const entry = findEntry(cacheName, hookId);
   if (!entry) return;
 
   const message = error?.message ?? "";
@@ -67,14 +122,13 @@ apiWorker.onmessage = (event: MessageEvent<WorkerMessagePayload>) => {
     entry.error = message;
     entry.loading = false;
   } else {
-    entry.data = data;
-    entry.meta = meta ?? null;
+    entry.data = msg.data ?? null;
+    entry.meta = msg.meta ?? null;
     entry.lastActivityAt = Date.now();
     entry.error = null;
     entry.loading = false;
   }
-  entry.requestId = null;
-  entry.setUpdateTrigger?.(updater);
+  finalizeEntry(entry);
 };
 
 // ============================================================================
@@ -96,7 +150,7 @@ export const useApiWorker = <T>(config: UseApiWorkerConfig): UseApiWorkerReturn<
 
   if (!storeEntry) {
     const hookId = uniqueId();
-    responseQueue[queueKey] = {
+    storeEntry = responseQueue[queueKey] = {
       hookId,
       cacheName,
       data: null,
@@ -107,7 +161,6 @@ export const useApiWorker = <T>(config: UseApiWorkerConfig): UseApiWorkerReturn<
       meta: null,
       lastActivityAt: null,
     };
-    storeEntry = responseQueue[queueKey];
     hookIdRef.current = hookId;
   } else {
     hookIdRef.current = storeEntry.hookId;
@@ -129,45 +182,38 @@ export const useApiWorker = <T>(config: UseApiWorkerConfig): UseApiWorkerReturn<
     runStaleEntryCleanup();
   });
 
-  const makeRequest = useCustomCallback(() => {
-    if (!enabled || (runMode === "once" && hasExecutedRef.current)) return;
+  const doRequest = useCallback(() => {
     const entry = responseQueue[queueKey];
     if (!entry || entry.loading) return;
-    const requestId = uniqueId();
-    entry.requestId = requestId;
     entry.loading = true;
     entry.error = null;
     entry.lastActivityAt = Date.now();
     entry.setUpdateTrigger?.(updater);
-
-    const dataRequest: DataRequest<unknown> = requestConfig
-      ? {
-          type: "set",
-          cacheName,
-          hookId,
-          requestId,
-          payload: configData,
-          request: requestConfig,
-        }
-      : { type: "get", cacheName, hookId };
-
-    apiWorker.postMessage({ dataRequest });
-    hasExecutedRef.current = true;
-  }, [hookId, queueKey, cacheName, requestConfig, configData, runMode, enabled]);
-
-  const shouldRun = (runMode === "auto" || runMode === "once") && enabled && (requestConfig || cacheName);
-  if (shouldRun && !(runMode === "once" && hasExecutedRef.current) && !storeEntry.loading) {
-    const now = Date.now();
     if (requestConfig) {
-      makeRequest();
+      const requestId = uniqueId();
+      entry.requestId = requestId;
+      const request =
+        requestConfig.responseType?.toLowerCase() === "stream" && requestConfig.retries === undefined
+          ? { ...requestConfig, retries: 3 }
+          : requestConfig;
+      apiWorker.postMessage({
+        dataRequest: { type: "set", cacheName, hookId, requestId, payload: configData, request },
+      });
     } else {
-      storeEntry.loading = true;
-      storeEntry.error = null;
-      storeEntry.lastActivityAt = now;
-      if (runMode === "once") hasExecutedRef.current = true;
-      setUpdateTrigger(updater);
       apiWorker.postMessage({ dataRequest: { type: "get", cacheName, hookId } as DataRequest<unknown> });
     }
+    hasExecutedRef.current = true;
+  }, [queueKey, cacheName, hookId, requestConfig, configData]);
+
+  const makeRequest = useCustomCallback(() => {
+    if (!enabled || (runMode === "once" && hasExecutedRef.current)) return;
+    doRequest();
+  }, [enabled, runMode, doRequest]);
+
+  const hasAlreadyRunOnce = runMode === "once" && hasExecutedRef.current;
+  const shouldRun = (runMode === "auto" || runMode === "once") && enabled && (requestConfig || cacheName);
+  if (shouldRun && !hasAlreadyRunOnce && !storeEntry.loading) {
+    doRequest();
   }
 
   return {

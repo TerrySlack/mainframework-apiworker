@@ -26,6 +26,38 @@ const sendNoResponse = (data: unknown): Promise<void> => {
   return new Promise((r) => setTimeout(r, 50));
 };
 
+const sendStream = (
+  data: unknown,
+  timeoutMs = 10000,
+): Promise<{ stream: string; data?: ArrayBuffer; meta?: unknown; error?: { message: string } }[]> =>
+  new Promise((resolve, reject) => {
+    const collected: { stream: string; data?: ArrayBuffer; meta?: unknown; error?: { message: string } }[] = [];
+    const handler = (payload: {
+      msg?: { stream?: string; data?: ArrayBuffer; meta?: unknown; error?: { message: string } };
+      error?: string;
+    }) => {
+      if (payload.error) {
+        worker.off("message", handler);
+        reject(new Error(payload.error));
+        return;
+      }
+      const m = payload.msg;
+      if (m && "stream" in m && m.stream) {
+        collected.push({ stream: m.stream, data: m.data, meta: m.meta, error: m.error });
+        if (m.stream === "end") {
+          worker.off("message", handler);
+          resolve(collected);
+        }
+      }
+    };
+    worker.on("message", handler);
+    worker.postMessage({ dataRequest: data });
+    setTimeout(() => {
+      worker.off("message", handler);
+      reject(new Error("Stream timeout"));
+    }, timeoutMs);
+  });
+
 afterAll(async () => {
   await worker.terminate();
 });
@@ -240,5 +272,74 @@ describe("api.worker", () => {
       expect(msg.data).toBeDefined();
       expect(msg.data?.url).toBe("https://httpbin.org/get");
     });
+
+    it("GET with responseType stream sends start, chunk(s), end", async () => {
+      const cacheName = "http-stream-" + Math.random();
+      const messages = await sendStream({
+        type: "set",
+        cacheName,
+        request: {
+          url: "https://httpbin.org/stream-bytes/128",
+          method: "GET",
+          responseType: "stream",
+        },
+        hookId: "h1",
+      });
+      expect(messages.length).toBeGreaterThanOrEqual(2);
+      expect(messages[0].stream).toBe("start");
+      expect(messages[0].meta).toBeDefined();
+      expect(messages[messages.length - 1].stream).toBe("end");
+      expect(messages[messages.length - 1].error?.message ?? "").toBe("");
+      const chunks = messages.filter((m) => m.stream === "chunk");
+      expect(chunks.length).toBeGreaterThanOrEqual(1);
+    });
+
+    it("streams audio URL in chunks (start, chunk(s), end)", async () => {
+      const cacheName = "stream-audio-" + Math.random();
+      const messages = await sendStream(
+        {
+          type: "set",
+          cacheName,
+          request: {
+            url: "http://stream.smoothjazz.com:80/stream",
+            method: "GET",
+            responseType: "stream",
+          },
+          hookId: "h1",
+        },
+        20000,
+      );
+      expect(messages.length).toBeGreaterThanOrEqual(1);
+      expect(messages[messages.length - 1].stream).toBe("end");
+      if (messages.length >= 2) {
+        expect(messages[0].stream).toBe("start");
+        const chunks = messages.filter((m) => m.stream === "chunk");
+        expect(chunks.length).toBeGreaterThanOrEqual(1);
+      }
+    }, 25000);
+
+    it("streams video playlist URL in chunks (start, chunk(s), end)", async () => {
+      const cacheName = "stream-video-" + Math.random();
+      const messages = await sendStream(
+        {
+          type: "set",
+          cacheName,
+          request: {
+            url: "https://bitdash-a.akamaihd.net/content/sintel/hls/playlist.m3u8",
+            method: "GET",
+            responseType: "stream",
+          },
+          hookId: "h1",
+        },
+        15000,
+      );
+      expect(messages.length).toBeGreaterThanOrEqual(1);
+      expect(messages[messages.length - 1].stream).toBe("end");
+      if (messages.length >= 2) {
+        expect(messages[0].stream).toBe("start");
+        const chunks = messages.filter((m) => m.stream === "chunk");
+        expect(chunks.length).toBeGreaterThanOrEqual(1);
+      }
+    }, 20000);
   });
 });

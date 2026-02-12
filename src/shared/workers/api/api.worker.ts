@@ -47,14 +47,54 @@ const callerResponseBinary = (
   httpStatus?: number,
   error: WorkerErrorPayload = NO_ERROR,
 ): void => {
-  const buffer = data && data.byteLength > 0 ? data : new ArrayBuffer(0);
+  const buffer = data?.byteLength ? data : new ArrayBuffer(0);
   const payload = { cacheName, data: buffer, meta, hookId, httpStatus, error };
-  if (buffer === data) {
-    self.postMessage(payload, [buffer]);
-  } else {
-    self.postMessage(payload);
-  }
+  self.postMessage(payload, buffer.byteLength > 0 ? [buffer] : []);
 };
+
+const callerResponseStreamStart = (
+  cacheName: string,
+  meta: BinaryResponseMeta | null,
+  hookId?: string | null,
+  httpStatus?: number,
+  error: WorkerErrorPayload = NO_ERROR,
+): void => {
+  self.postMessage({ cacheName, stream: "start", meta, hookId, httpStatus, error });
+};
+
+const callerResponseStreamResume = (
+  cacheName: string,
+  meta: BinaryResponseMeta | null,
+  hookId?: string | null,
+  httpStatus?: number,
+  error: WorkerErrorPayload = NO_ERROR,
+): void => {
+  self.postMessage({ cacheName, stream: "resume", meta, hookId, httpStatus, error });
+};
+
+const callerResponseStreamChunk = (
+  cacheName: string,
+  data: ArrayBuffer,
+  hookId?: string | null,
+  error: WorkerErrorPayload = NO_ERROR,
+): void => {
+  const buffer = data?.byteLength ? data : new ArrayBuffer(0);
+  const payload = { cacheName, stream: "chunk", data: buffer, hookId, error };
+  self.postMessage(payload, buffer.byteLength > 0 ? [buffer] : []);
+};
+
+const callerResponseStreamEnd = (
+  cacheName: string,
+  hookId?: string | null,
+  error: WorkerErrorPayload = NO_ERROR,
+): void => {
+  self.postMessage({ cacheName, stream: "end", hookId, error });
+};
+
+const transferableBuffer = (view: Uint8Array): ArrayBuffer =>
+  view.byteOffset === 0 && view.byteLength === view.buffer.byteLength
+    ? (view.buffer as ArrayBuffer)
+    : view.slice(0).buffer;
 
 const store = Object.create(null) as Record<string, unknown>;
 const normalizeKey = (key: string) => key.toLocaleLowerCase();
@@ -77,20 +117,18 @@ const omitContentType = (headers: Record<string, string>): Record<string, string
 };
 
 const isBinaryResponse = (r: unknown): r is BinaryParseResult =>
-  !!r &&
   typeof r === "object" &&
+  r !== null &&
   BINARY_MARKER in r &&
-  (r as Record<symbol, unknown>)[BINARY_MARKER] === true &&
   (r as unknown as BinaryParseResult).data instanceof ArrayBuffer;
 
 const commit = <TData>(cacheName: string, data: TData, hookId?: string | null, httpStatus?: number): void => {
-  if (cacheName) {
-    set(normalizeKey(cacheName), data);
-    callerResponse(cacheName, data, hookId, httpStatus);
+  if (!cacheName) {
+    callerResponse("", null, hookId, undefined, makeError("Invalid commit: cacheName is required"));
     return;
   }
-
-  callerResponse("", null, hookId, undefined, makeError("Invalid commit: cacheName is required"));
+  set(normalizeKey(cacheName), data);
+  callerResponse(cacheName, data, hookId, httpStatus);
 };
 
 /**
@@ -155,13 +193,18 @@ const appendToFormData = (
     set.add(value);
     if (Array.isArray(value)) {
       let hasFile = false;
-      for (let i = 0; i < value.length; i++) {
+      let i = 0;
+      while (i < value.length) {
         hasFile = appendToFormData(formData, key ? `${key}.${i}` : String(i), value[i], fileFieldName, set) || hasFile;
+        i++;
       }
       return hasFile;
     }
     let hasFile = false;
-    for (const k in value) {
+    const keys = Object.keys(value);
+    let ki = 0;
+    while (ki < keys.length) {
+      const k = keys[ki] as string;
       if (Object.prototype.hasOwnProperty.call(value, k)) {
         hasFile =
           appendToFormData(
@@ -172,6 +215,7 @@ const appendToFormData = (
             set,
           ) || hasFile;
       }
+      ki++;
     }
     return hasFile;
   }
@@ -233,24 +277,22 @@ const prepareRequestBody = (
   options?: { formDataFileFieldName?: string; formDataKey?: string },
 ): { body?: BodyInit; headers: Record<string, string> } => {
   const payloadType = getPayloadType(payload);
-  const outHeaders = (): Record<string, string> => ({ ...headers });
 
   switch (payloadType) {
     case "formdata":
-      return { body: payload as FormData, headers: omitContentType(outHeaders()) };
+      return { body: payload as FormData, headers: omitContentType({ ...headers }) };
     case "blob":
-      return { body: payload as Blob, headers: outHeaders() };
+      return { body: payload as Blob, headers: { ...headers } };
     case "arraybuffer":
-      return { body: payload as ArrayBuffer, headers: outHeaders() };
+      return { body: payload as ArrayBuffer, headers: { ...headers } };
     case "arraybufferview":
-      return { body: payload as BodyInit, headers: outHeaders() };
+      return { body: payload as BodyInit, headers: { ...headers } };
     case "stream":
-      return { body: payload as ReadableStream<Uint8Array>, headers: outHeaders() };
+      return { body: payload as ReadableStream<Uint8Array>, headers: { ...headers } };
     case "string":
-      return { body: payload as string, headers: outHeaders() };
+      return { body: payload as string, headers: { ...headers } };
     case "object": {
-      /* Serialize by Content-Type: json, urlencoded, text, or multipart (with File/Blob). */
-      const h = outHeaders();
+      const h = { ...headers };
       const contentType = getContentType(h);
       const fileFieldName = options?.formDataFileFieldName ?? DEFAULT_FILES_FIELD;
       const formDataKey = options?.formDataKey ?? DEFAULT_FILES_FIELD;
@@ -280,7 +322,7 @@ const prepareRequestBody = (
     }
 
     default:
-      return { headers: outHeaders() };
+      return { headers: { ...headers } };
   }
 };
 
@@ -300,6 +342,7 @@ const apiRequest = async <TData>(
     timeoutMs,
     formDataFileFieldName,
     formDataKey,
+    retries,
   }: WorkerApiRequest,
   requestId?: string | null,
   hookId?: string | null,
@@ -340,13 +383,10 @@ const apiRequest = async <TData>(
     };
 
     if (methodLower !== "get" && payload != null) {
-      let prepareOptions: { formDataFileFieldName?: string; formDataKey?: string } | undefined;
-      if (formDataFileFieldName != null && formDataFileFieldName !== "") {
-        prepareOptions = { formDataFileFieldName };
-      }
-      if (formDataKey != null && formDataKey !== "") {
-        prepareOptions = { ...prepareOptions, formDataKey };
-      }
+      const prepareOptions: { formDataFileFieldName?: string; formDataKey?: string } = {};
+      if (formDataFileFieldName != null && formDataFileFieldName !== "")
+        prepareOptions.formDataFileFieldName = formDataFileFieldName;
+      if (formDataKey != null && formDataKey !== "") prepareOptions.formDataKey = formDataKey;
       const { body, headers: processedHeaders } = prepareRequestBody(payload, headers, prepareOptions);
       if (body !== undefined) fetchOptions.body = body;
       fetchOptions.headers = processedHeaders;
@@ -355,6 +395,71 @@ const apiRequest = async <TData>(
     }
 
     try {
+      if (responseTypeLower === "stream") {
+        const maxRetries = Math.min(retries ?? 3, 5);
+        let bytesReceived = 0;
+        let streamError: WorkerErrorPayload = NO_ERROR;
+        let attempt = 0;
+        while (attempt <= maxRetries) {
+          try {
+            const reqHeaders =
+              methodLower === "get" ? omitContentType({ ...fetchOptions.headers }) : fetchOptions.headers;
+            if (bytesReceived > 0) reqHeaders["Range"] = `bytes=${bytesReceived}-`;
+            const streamResponse = await fetch(url, { ...fetchOptions, headers: reqHeaders });
+            if (streamResponse.status >= 400) {
+              streamError = makeError(streamResponse.statusText);
+              break;
+            }
+            if (streamResponse.status === 204) {
+              callerResponseStreamEnd(cacheName, hookId);
+              return;
+            }
+            if (streamResponse.status === 416) break;
+            const contentType = streamResponse.headers.get("content-type") ?? undefined;
+            const meta: BinaryResponseMeta = {
+              contentDisposition: streamResponse.headers.get("content-disposition") ?? null,
+              ...(contentType !== undefined && { contentType }),
+            };
+            if (bytesReceived === 0) callerResponseStreamStart(cacheName, meta, hookId, streamResponse.status);
+            else callerResponseStreamResume(cacheName, meta, hookId, streamResponse.status);
+            const body = streamResponse.body;
+            if (!body) {
+              callerResponseStreamEnd(cacheName, hookId);
+              return;
+            }
+            const reader = body.getReader();
+            let skipRemaining = streamResponse.status === 200 && bytesReceived > 0 ? bytesReceived : 0;
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              if (!value || value.byteLength === 0) continue;
+              if (skipRemaining > 0) {
+                if (value.byteLength <= skipRemaining) {
+                  skipRemaining -= value.byteLength;
+                  continue;
+                }
+                const offset = skipRemaining;
+                skipRemaining = 0;
+                const tail = value.subarray(offset);
+                callerResponseStreamChunk(cacheName, transferableBuffer(tail), hookId);
+                bytesReceived += tail.byteLength;
+              } else {
+                callerResponseStreamChunk(cacheName, transferableBuffer(value), hookId);
+                bytesReceived += value.byteLength;
+              }
+            }
+            break;
+          } catch (err) {
+            streamError =
+              (err as Error).name === "AbortError" ? makeError("Request aborted") : makeError((err as Error).message);
+            if (attempt === maxRetries) break;
+          }
+          attempt++;
+        }
+        callerResponseStreamEnd(cacheName, hookId, streamError);
+        return;
+      }
+
       const response = await fetch(url, fetchOptions);
 
       if (response.status >= 400) {

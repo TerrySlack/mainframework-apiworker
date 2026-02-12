@@ -17,6 +17,8 @@ export interface RequestConfig {
   formDataFileFieldName?: string;
   /** FormData key for the root payload when building multipart form data. Passed to the worker in dataRequest.request. */
   formDataKey?: string;
+  /** For responseType "stream": number of retries on connection loss (default 3). Capped at 5 in the worker. */
+  retries?: number;
 }
 
 export type RunMode = "auto" | "manual" | "once";
@@ -89,27 +91,65 @@ export type AbortControllers = Map<string, AbortController>;
  * Worker response messages. Use in client onmessage handler:
  * - data + meta: binary response (data is ArrayBuffer). Reconstruct: new Blob([data], { type: meta?.contentType })
  * - data only: JSON/text response
+ * - stream: "start" | "chunk" | "end" — client handles chunk sequence then finalizes
  * - error: error response with message and code
  */
 export type WorkerResponseMessage =
   | { cacheName: string; data: unknown; error: WorkerErrorPayload }
   | { cacheName: string; data: ArrayBuffer; meta: BinaryResponseMeta; error: WorkerErrorPayload }
-  | { cacheName: string; error: WorkerErrorPayload };
+  | { cacheName: string; error: WorkerErrorPayload }
+  | {
+      cacheName: string;
+      stream: "start";
+      meta: BinaryResponseMeta | null;
+      hookId?: string;
+      httpStatus?: number;
+      error: WorkerErrorPayload;
+    }
+  | {
+      cacheName: string;
+      stream: "resume";
+      meta: BinaryResponseMeta | null;
+      hookId?: string;
+      httpStatus?: number;
+      error: WorkerErrorPayload;
+    }
+  | { cacheName: string; stream: "chunk"; data: ArrayBuffer; hookId?: string; error: WorkerErrorPayload }
+  | { cacheName: string; stream: "end"; hookId?: string; error: WorkerErrorPayload };
 
 /**
  * Payload shape for worker postMessage. Use for client onmessage:
  * MessageEvent<WorkerMessagePayload>. The worker always sends error (same shape: { message: string }).
  * No error = { message: "" }. With error = { message: "..." }.
+ * When stream is present, client receives start → chunk(s) → end; cancel via existing requestId/cancel.
  */
-export interface WorkerMessagePayload {
-  cacheName?: string;
-  data?: unknown;
-  meta?: BinaryResponseMeta;
-  /** Always present: { message: "" } when no error, { message: "..." } when failed. */
-  error: WorkerErrorPayload;
-  hookId?: string;
-  httpStatus?: number;
-}
+export type WorkerMessagePayload =
+  | {
+      cacheName?: string;
+      data?: unknown;
+      meta?: BinaryResponseMeta;
+      error: WorkerErrorPayload;
+      hookId?: string;
+      httpStatus?: number;
+    }
+  | {
+      cacheName: string;
+      stream: "start";
+      meta: BinaryResponseMeta | null;
+      hookId?: string;
+      httpStatus?: number;
+      error: WorkerErrorPayload;
+    }
+  | {
+      cacheName: string;
+      stream: "resume";
+      meta: BinaryResponseMeta | null;
+      hookId?: string;
+      httpStatus?: number;
+      error: WorkerErrorPayload;
+    }
+  | { cacheName: string; stream: "chunk"; data: ArrayBuffer; hookId?: string; error: WorkerErrorPayload }
+  | { cacheName: string; stream: "end"; hookId?: string; error: WorkerErrorPayload };
 
 export interface StackArray {
   key: string;
