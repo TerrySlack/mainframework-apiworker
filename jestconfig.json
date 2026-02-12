@@ -1,5 +1,4 @@
 {
-  "globalSetup": "<rootDir>/jest-global-setup.cjs",
   "transform": { "^.+\\.(t|j)sx?$": "<rootDir>/jest-import-meta-transform.cjs" },
   "testRegex": "(/tests/.*|(\\.|/)(test|spec))\\.(jsx?|tsx?)$",
   "testPathIgnorePatterns": ["\\.rollup\\.cache"],
@@ -7,8 +6,6 @@
   "testEnvironment": "jsdom",
   "passWithNoTests": true,
   "setupFiles": ["<rootDir>/jest.worker-setup.ts"],
-  "moduleNameMapper": {
-    "@mainframework/is-deep-equal": "<rootDir>/jest-is-deep-equal-stub.cjs",
-    "node-fetch": "<rootDir>/jest-node-fetch-stub.cjs"
-  }
+  "globalTeardown": "<rootDir>/jest.global-teardown.cjs",
+  "moduleNameMapper": { "@mainframework/is-deep-equal": "<rootDir>/jest-is-deep-equal-stub.cjs" }
 }

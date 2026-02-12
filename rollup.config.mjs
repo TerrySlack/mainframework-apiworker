@@ -25,7 +25,7 @@ export default {
     }),
     resolve(),
     typescript({
-      tsconfig: "tsconfig.json",
+      tsconfig: "tsconfig.rollup.json",
     }),
   ],
   external: ["react"],

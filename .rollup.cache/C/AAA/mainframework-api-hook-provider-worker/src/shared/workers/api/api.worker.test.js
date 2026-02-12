@@ -1,8 +1,9 @@
 /// <reference types="jest" />
+/// <reference types="node" />
 import { Worker } from "worker_threads";
 import path from "path";
-const bootstrapPath = path.resolve(process.cwd(), "test-worker-bootstrap.mjs");
-let worker;
+const workerScriptPath = path.resolve(process.cwd(), "test-worker-bootstrap.mjs");
+const worker = new Worker(workerScriptPath);
 function send(data) {
   return new Promise((resolve, reject) => {
     const handler = (payload) => {
@@ -15,18 +16,15 @@ function send(data) {
     setTimeout(() => {
       worker.off("message", handler);
       reject(new Error("Timeout"));
-    }, 3000);
+    }, 5000);
   });
 }
 function sendNoResponse(data) {
   worker.postMessage({ dataRequest: data });
-  return new Promise((r) => setTimeout(r, 10));
+  return new Promise((r) => setTimeout(r, 50));
 }
-beforeAll(() => {
-  worker = new Worker(bootstrapPath);
-});
-afterAll(() => {
-  void worker.terminate();
+afterAll(async () => {
+  await worker.terminate();
 });
 describe("api.worker", () => {
   describe("validation", () => {
@@ -93,21 +91,21 @@ describe("api.worker", () => {
   });
   describe("get", () => {
     it("responds with CACHE_MISS when key is not in cache", async () => {
-      const msg = await send({ type: "get", cacheName: "nonexistent-key-1", hookId: "h1" });
+      const msg = await send({ type: "get", cacheName: "nonexistent-key", hookId: "h1" });
       expect(msg).toMatchObject({
-        cacheName: "nonexistent-key-1",
+        cacheName: "nonexistent-key",
         data: { kind: "validation", message: "Cache miss", code: "CACHE_MISS" },
         hookId: "h1",
       });
     });
     it("responds with cached data when key exists", async () => {
-      const cacheName = "get-hit-key-" + Math.random();
+      const cacheName = "get-hit-" + Math.random();
       await sendNoResponse({ type: "set", cacheName, payload: { value: 42 }, hookId: "h1" });
       const msg = await send({ type: "get", cacheName, hookId: "h2" });
       expect(msg).toMatchObject({ cacheName, data: { value: 42 }, hookId: "h2" });
     });
     it("normalizes cacheName to lowercase for get", async () => {
-      const cacheName = "GetCaseKey-" + Math.random();
+      const cacheName = "GetCase-" + Math.random();
       await sendNoResponse({ type: "set", cacheName: cacheName.toUpperCase(), payload: { x: 1 } });
       const msg = await send({ type: "get", cacheName: cacheName.toLowerCase() });
       expect(msg).toMatchObject({ cacheName: cacheName.toLowerCase(), data: { x: 1 } });
@@ -115,7 +113,7 @@ describe("api.worker", () => {
   });
   describe("set (cache only)", () => {
     it("stores payload when no request; get returns stored data", async () => {
-      const cacheName = "set-cache-only-" + Math.random();
+      const cacheName = "set-cache-" + Math.random();
       await sendNoResponse({ type: "set", cacheName, payload: { a: 1, b: 2 }, hookId: "h1" });
       const msg = await send({ type: "get", cacheName });
       expect(msg).toMatchObject({ cacheName, data: { a: 1, b: 2 } });
@@ -132,6 +130,32 @@ describe("api.worker", () => {
         cacheName,
         data: { kind: "validation", message: "Cache miss", code: "CACHE_MISS" },
       });
+    });
+  });
+  describe("onmessage", () => {
+    it("ignores message without dataRequest and worker still works", async () => {
+      worker.postMessage({});
+      await new Promise((r) => setTimeout(r, 50));
+      const msg = await send({ type: "get", cacheName: "after-empty-msg", hookId: "h1" });
+      expect(msg).toMatchObject({
+        cacheName: "after-empty-msg",
+        data: { kind: "validation", message: "Cache miss", code: "CACHE_MISS" },
+      });
+    });
+  });
+  describe("set with request (HTTP)", () => {
+    it("GET request returns data and httpStatus", async () => {
+      const cacheName = "http-get-" + Math.random();
+      const msg = await send({
+        type: "set",
+        cacheName,
+        request: { url: "https://httpbin.org/get", method: "GET" },
+        hookId: "h1",
+      });
+      expect(msg).toMatchObject({ cacheName, hookId: "h1" });
+      expect(msg.httpStatus).toBe(200);
+      expect(msg.data).toBeDefined();
+      expect(msg.data?.url).toBe("https://httpbin.org/get");
     });
   });
 });

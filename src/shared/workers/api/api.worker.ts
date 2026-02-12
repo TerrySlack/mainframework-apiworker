@@ -5,9 +5,9 @@ import type {
   BinaryParseResult,
   BinaryResponseMeta,
   DataRequest,
-  StackArray,
   WorkerApiRequest,
   WorkerErrorKind,
+  WorkerMessageData,
 } from "../../types/types";
 
 export const BINARY_MARKER = Symbol.for("WorkerApiBinary");
@@ -132,96 +132,65 @@ const appendToFormData = (
   key: string,
   value: unknown,
   fileFieldName: string = DEFAULT_FILES_FIELD,
-): void => {
+  visited?: WeakSet<object>,
+): boolean => {
+  const formFieldName = key ? key : fileFieldName;
   if (value instanceof File) {
-    formData.append(fileFieldName, value, value.name);
-    return;
+    formData.append(formFieldName, value, value.name);
+    return true;
   }
 
   if (value instanceof Blob) {
-    formData.append(fileFieldName, value, "blob");
-    return;
+    formData.append(formFieldName, value, "blob");
+    return true;
+  }
+
+  if (value !== null && value !== undefined && typeof value === "object") {
+    const set = visited ?? new WeakSet<object>();
+    if (set.has(value)) return false;
+    set.add(value);
+    if (Array.isArray(value)) {
+      let hasFile = false;
+      for (let i = 0; i < value.length; i++) {
+        hasFile = appendToFormData(formData, key ? `${key}.${i}` : String(i), value[i], fileFieldName, set) || hasFile;
+      }
+      return hasFile;
+    }
+    let hasFile = false;
+    for (const k in value) {
+      if (Object.prototype.hasOwnProperty.call(value, k)) {
+        hasFile =
+          appendToFormData(
+            formData,
+            key ? `${key}.${k}` : k,
+            (value as Record<string, unknown>)[k],
+            fileFieldName,
+            set,
+          ) || hasFile;
+      }
+    }
+    return hasFile;
   }
 
   if (value !== undefined && value !== null) {
-    if (typeof value === "object") {
-      formData.append(key, JSON.stringify(value));
-    } else {
-      const primitive = value as string | number | boolean | bigint | symbol;
-      formData.append(key, String(primitive));
-    }
+    const primitive = value as string | number | boolean | bigint | symbol;
+    formData.append(key, primitive as string | Blob);
   }
+  return false;
 };
 
-const pushObjectToStack = (
-  obj: Record<string, unknown>,
-  parentKey: string,
-  stack: Array<{ key: string; value: unknown }>,
-) => {
-  for (const k in obj) {
-    if (Object.prototype.hasOwnProperty.call(obj, k)) {
-      stack.push({
-        key: parentKey ? `${parentKey}.${k}` : k,
-        value: obj[k],
-      });
-    }
-  }
-};
-
-const createFormDataIfBlobOrFile = (payload: unknown, fileFieldName: string = DEFAULT_FILES_FIELD): FormData | null => {
+const createFormDataIfBlobOrFile = (
+  payload: unknown,
+  fileFieldName: string = DEFAULT_FILES_FIELD,
+  formDataKey: string = DEFAULT_FILES_FIELD,
+): FormData | null => {
   if (payload === null || payload === undefined || typeof payload !== "object") {
     return null;
   }
 
   const formData = new FormData();
-  let hasFile = false;
   const visited = new WeakSet<object>();
-  const stack: StackArray[] = [];
-
-  visited.add(payload);
-  if (Array.isArray(payload)) {
-    let i = 0;
-    while (i < payload.length) {
-      stack.push({ key: String(i), value: payload[i] });
-      i++;
-    }
-  } else {
-    pushObjectToStack(payload as Record<string, unknown>, "", stack);
-  }
-
-  // Safe iteration - iterate forward, then clear
-  for (let i = 0; i < stack.length; i++) {
-    const entry = stack[i];
-    if (entry === undefined) continue;
-    const { key, value } = entry;
-
-    if (value instanceof File || value instanceof Blob) {
-      hasFile = true;
-      appendToFormData(formData, key, value, fileFieldName);
-      continue;
-    }
-
-    if (Array.isArray(value)) {
-      if (visited.has(value)) continue;
-      visited.add(value);
-      let j = 0;
-      while (j < value.length) {
-        stack.push({ key: `${key}.${j}`, value: value[j] });
-        j++;
-      }
-      continue;
-    }
-
-    if (value !== null && typeof value === "object") {
-      if (visited.has(value)) continue;
-      visited.add(value);
-      pushObjectToStack(value as Record<string, unknown>, key, stack);
-      continue;
-    }
-
-    appendToFormData(formData, key, value, fileFieldName);
-  }
-
+  const hasFile = appendToFormData(formData, formDataKey, payload, fileFieldName, visited);
   return hasFile ? formData : null;
 };
 
@@ -254,7 +223,7 @@ const buildTextBody = (payload: unknown): BodyInit => String(payload);
 const prepareRequestBody = (
   payload: unknown,
   headers: Record<string, string>,
-  options?: { formDataFileFieldName?: string },
+  options?: { formDataFileFieldName?: string; formDataKey?: string },
 ): { body?: BodyInit; headers: Record<string, string> } => {
   const payloadType = getPayloadType(payload);
   const outHeaders = (): Record<string, string> => ({ ...headers });
@@ -282,6 +251,7 @@ const prepareRequestBody = (
       const h = outHeaders();
       const contentType = getContentType(h);
       const fileFieldName = options?.formDataFileFieldName ?? DEFAULT_FILES_FIELD;
+      const formDataKey = options?.formDataKey ?? DEFAULT_FILES_FIELD;
 
       let body: BodyInit;
       if (contentType.includes("application/json")) {
@@ -291,7 +261,7 @@ const prepareRequestBody = (
       } else if (contentType.startsWith("text/") || contentType.includes("xml")) {
         body = buildTextBody(payload);
       } else if (contentType.includes("multipart/form-data")) {
-        const formData = createFormDataIfBlobOrFile(payload, fileFieldName);
+        const formData = createFormDataIfBlobOrFile(payload, fileFieldName, formDataKey);
         if (formData) {
           return { body: formData, headers: omitContentType(h) };
         }
@@ -327,6 +297,7 @@ const apiRequest = async <TData>(
     responseType,
     timeoutMs,
     formDataFileFieldName,
+    formDataKey,
   }: WorkerApiRequest,
   requestId?: string | null,
   hookId?: string | null,
@@ -367,11 +338,14 @@ const apiRequest = async <TData>(
     };
 
     if (methodLower !== "get" && payload != null) {
-      const { body, headers: processedHeaders } = prepareRequestBody(
-        payload,
-        headers,
-        formDataFileFieldName != null && formDataFileFieldName !== "" ? { formDataFileFieldName } : undefined,
-      );
+      let prepareOptions: { formDataFileFieldName?: string; formDataKey?: string } | undefined;
+      if (formDataFileFieldName != null && formDataFileFieldName !== "") {
+        prepareOptions = { formDataFileFieldName };
+      }
+      if (formDataKey != null && formDataKey !== "") {
+        prepareOptions = { ...prepareOptions, formDataKey };
+      }
+      const { body, headers: processedHeaders } = prepareRequestBody(payload, headers, prepareOptions);
       if (body !== undefined) fetchOptions.body = body;
       fetchOptions.headers = processedHeaders;
     } else {
@@ -507,20 +481,14 @@ const onCancel = (requestId: string): void => {
   }
 };
 
-type WorkerMessageData = { dataRequest?: DataRequest<unknown> };
-
 /**
- * Public API: handle incoming messages from the main thread.
- * Expects payload shape { dataRequest?: DataRequest }. Dispatches to get/set/delete/cancel.
- * Responses are sent via postMessage: { cacheName, data?, meta?, hookId?, httpStatus? }.
- * Errors are sent as data: { kind: "http"|"network"|"validation", message, status?, code? }.
+ * Incoming messages from the main thread. Expects payload shape { dataRequest?: DataRequest }.
+ * Dispatches to get/set/delete/cancel. Responses via postMessage: { cacheName, data?, meta?, hookId?, httpStatus? }.
+ * Errors as data: { kind: "http"|"network"|"validation", message, status?, code? }.
  */
-export function handleMessage(data: unknown): void {
+onmessage = (event: MessageEvent): void => {
+  const data = event.data as DataRequest;
   if (data === null || typeof data !== "object") return;
   const dataRequest = (data as WorkerMessageData).dataRequest;
   if (dataRequest !== undefined) onRequest(dataRequest);
-}
-
-onmessage = (event: MessageEvent): void => {
-  handleMessage(event.data);
 };

@@ -15,6 +15,8 @@ export interface RequestConfig {
   timeoutMs?: number;
   /** FormData field name for File/Blob parts. Default "Files". */
   formDataFileFieldName?: string;
+  /** FormData key for the root payload when building multipart form data. Passed to the worker in dataRequest.request. */
+  formDataKey?: string;
 }
 
 export type RunMode = "auto" | "manual" | "once";
@@ -174,3 +176,5 @@ export type ContentType =
   | "font/woff2"
   | "font/ttf"
   | "font/otf";
+
+export type WorkerMessageData = { dataRequest?: DataRequest<unknown> };
