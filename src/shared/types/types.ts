@@ -17,6 +17,10 @@ export interface RequestConfig {
   formDataKey?: string;
   /** For responseType "stream": number of retries on connection loss (default 3). Capped at 5 in the worker. */
   retries?: number;
+  /** For responseType "stream": flush batch to consumer every N chunks (default 5). */
+  streamChunkBatchSize?: number;
+  /** For responseType "stream": flush batch to consumer at most every N ms (default 50). */
+  streamChunkThrottleMs?: number;
 }
 
 export type RunMode = "auto" | "manual" | "once";
@@ -72,6 +76,11 @@ export interface QueueEntry<T> {
   setUpdateTrigger: ((value: number | ((prev: number) => number)) => void) | null;
   requestId: string | null;
   lastActivityAt: number | null;
+  /** For responseType "stream": batch of chunks since last flush. Absent for non-stream. */
+  streamChunks?: ArrayBuffer[] | undefined;
+  /** Internal: throttle params set when stream request starts. */
+  streamChunkBatchSize?: number;
+  streamChunkThrottleMs?: number;
 }
 
 export interface UseApiWorkerReturn<T> {
@@ -81,6 +90,8 @@ export interface UseApiWorkerReturn<T> {
   error: string | null;
   refetch: () => void;
   deleteCache: () => void;
+  /** For responseType "stream": batch of chunks since last flush. Undefined for non-stream. */
+  streamChunks?: ArrayBuffer[] | undefined;
 }
 
 export type AbortControllers = Map<string, AbortController>;

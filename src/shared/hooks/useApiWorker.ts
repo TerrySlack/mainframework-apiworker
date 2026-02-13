@@ -12,6 +12,22 @@ import type {
 } from "../types/types";
 
 type StreamAccumulator = { chunks: ArrayBuffer[]; meta: BinaryResponseMeta | null };
+
+type StreamThrottleState = {
+  pendingChunks: ArrayBuffer[];
+  lastFlushTime: number;
+  timeoutId: ReturnType<typeof setTimeout> | null;
+};
+
+const DEFAULT_CHUNK_BATCH = 5;
+const DEFAULT_THROTTLE_MS = 50;
+
+const toNumber = (val: unknown, fallback: number): number =>
+  typeof val === "number" && Number.isFinite(val) ? val : fallback;
+
+const toStreamChunks = (val: unknown): ArrayBuffer[] | undefined =>
+  val === undefined || val === null ? undefined : Array.isArray(val) ? (val as ArrayBuffer[]) : undefined;
+
 import { useCustomCallback } from "./useCustomCallback";
 
 // ============================================================================
@@ -46,6 +62,10 @@ const runStaleEntryCleanup = (): void => {
         entry.error = null;
         entry.setUpdateTrigger = null;
         entry.requestId = null;
+        delete entry.streamChunks;
+        const throttleState = streamThrottleState[key];
+        if (throttleState?.timeoutId != null) clearTimeout(throttleState.timeoutId);
+        delete streamThrottleState[key];
       }
       i++;
     }
@@ -58,8 +78,22 @@ const runStaleEntryCleanup = (): void => {
 const responseQueue: Record<string, QueueEntry<unknown>> = {};
 
 const streamAccumulators: Record<string, StreamAccumulator> = {};
+const streamThrottleState: Record<string, StreamThrottleState> = {};
 
 const updater = (n: number) => n + 1;
+
+const flushStreamBatch = (key: string, entry: QueueEntry<unknown>): void => {
+  const state = streamThrottleState[key];
+  if (!state || state.pendingChunks.length === 0) return;
+  if (state.timeoutId != null) {
+    clearTimeout(state.timeoutId);
+    state.timeoutId = null;
+  }
+  entry.streamChunks = state.pendingChunks.slice();
+  state.pendingChunks.length = 0;
+  state.lastFlushTime = Date.now();
+  entry.setUpdateTrigger?.(updater);
+};
 
 const findEntry = (cacheName: string | undefined, hookId: string | undefined) =>
   cacheName
@@ -85,21 +119,47 @@ apiWorker.onmessage = (event: MessageEvent<WorkerMessagePayload>) => {
   if ("stream" in msg && msg.stream) {
     const entry = findEntry(cacheName, hookId);
     if (!entry) return;
+    const batchSize = toNumber(entry.streamChunkBatchSize, DEFAULT_CHUNK_BATCH);
+    const throttleMs = toNumber(entry.streamChunkThrottleMs, DEFAULT_THROTTLE_MS);
     switch (msg.stream) {
-      case "start":
+      case "start": {
         streamAccumulators[key] = { chunks: [], meta: msg.meta ?? null };
+        streamThrottleState[key] = { pendingChunks: [], lastFlushTime: Date.now(), timeoutId: null };
+        entry.streamChunks = [];
+        entry.meta = msg.meta ?? null;
+        entry.setUpdateTrigger?.(updater);
         return;
+      }
       case "resume":
         if (!streamAccumulators[key]) streamAccumulators[key] = { chunks: [], meta: msg.meta ?? null };
         else if (msg.meta) streamAccumulators[key].meta = msg.meta;
+        if (!streamThrottleState[key])
+          streamThrottleState[key] = { pendingChunks: [], lastFlushTime: Date.now(), timeoutId: null };
+        if (msg.meta) entry.meta = msg.meta ?? null;
         return;
       case "chunk": {
         const acc = streamAccumulators[key];
+        const throttle = streamThrottleState[key];
         if (acc && msg.data) acc.chunks.push(msg.data);
+        if (throttle && msg.data) {
+          throttle.pendingChunks.push(msg.data);
+          if (throttle.pendingChunks.length >= batchSize) {
+            flushStreamBatch(key, entry);
+          } else if (throttle.timeoutId == null) {
+            throttle.timeoutId = setTimeout(() => {
+              flushStreamBatch(key, entry);
+              throttle.timeoutId = null;
+            }, throttleMs);
+          }
+        }
         return;
       }
       case "end": {
         const acc = streamAccumulators[key];
+        const throttle = streamThrottleState[key];
+        if (throttle?.pendingChunks.length) flushStreamBatch(key, entry);
+        if (throttle?.timeoutId != null) clearTimeout(throttle.timeoutId);
+        delete streamThrottleState[key];
         delete streamAccumulators[key];
         const errMsg = error?.message ?? "";
         if (errMsg !== "") {
@@ -169,7 +229,8 @@ export const useApiWorker = <T>(config: UseApiWorkerConfig): UseApiWorkerReturn<
     hookIdRef.current = storeEntry.hookId;
     storeEntry.lastActivityAt = Date.now();
   }
-  storeEntry.setUpdateTrigger = setUpdateTrigger;
+  const entry = storeEntry;
+  entry.setUpdateTrigger = setUpdateTrigger;
 
   const hookId = hookIdRef.current;
 
@@ -195,10 +256,13 @@ export const useApiWorker = <T>(config: UseApiWorkerConfig): UseApiWorkerReturn<
     if (requestConfig) {
       const requestId = uniqueId();
       entry.requestId = requestId;
+      const isStream = requestConfig.responseType?.toLowerCase() === "stream";
+      if (isStream) {
+        entry.streamChunkBatchSize = toNumber(requestConfig.streamChunkBatchSize, DEFAULT_CHUNK_BATCH);
+        entry.streamChunkThrottleMs = toNumber(requestConfig.streamChunkThrottleMs, DEFAULT_THROTTLE_MS);
+      }
       const request =
-        requestConfig.responseType?.toLowerCase() === "stream" && requestConfig.retries === undefined
-          ? { ...requestConfig, retries: 3 }
-          : requestConfig;
+        isStream && requestConfig.retries === undefined ? { ...requestConfig, retries: 3 } : requestConfig;
       apiWorker.postMessage({
         dataRequest: { type: "set", cacheName, hookId, requestId, payload: configData, request },
       });
@@ -215,16 +279,18 @@ export const useApiWorker = <T>(config: UseApiWorkerConfig): UseApiWorkerReturn<
 
   const hasAlreadyRunOnce = runMode === "once" && hasExecutedRef.current;
   const shouldRun = (runMode === "auto" || runMode === "once") && enabled && (requestConfig || cacheName);
-  if (shouldRun && !hasAlreadyRunOnce && !storeEntry.loading) {
+  if (shouldRun && !hasAlreadyRunOnce && !entry.loading) {
     doRequest();
   }
 
-  return {
-    data: (storeEntry?.data as T) ?? null,
-    meta: storeEntry?.meta ?? null,
-    loading: storeEntry?.loading ?? false,
-    error: storeEntry?.error ?? null,
+  const ret: UseApiWorkerReturn<T> = {
+    data: (entry.data as T) ?? null,
+    meta: entry.meta ?? null,
+    loading: entry.loading ?? false,
+    error: entry.error ?? null,
     refetch: makeRequest,
     deleteCache,
+    streamChunks: toStreamChunks(entry.streamChunks),
   };
+  return ret;
 };

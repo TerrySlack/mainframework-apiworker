@@ -42,9 +42,7 @@ nodeWorker.on("message", (payload: { msg?: unknown; error?: string }) => {
   });
 });
 
-function RealWorkerConstructor() {
-  return realWorkerAdapter;
-}
+const RealWorkerConstructor = () => realWorkerAdapter;
 
 const RealWorker = RealWorkerConstructor as unknown as typeof Worker;
 const g =

@@ -14,7 +14,7 @@ afterAll(async () => {
 
 describe("useApiWorker", () => {
   describe("API shape", () => {
-    it("returns data, meta, loading, error, refetch, deleteCache", () => {
+    it("returns data, meta, loading, error, refetch, deleteCache, streamChunks", () => {
       const cacheName = "useApiWorker-shape-" + Date.now();
       const { result } = renderHook(() =>
         useApiWorker({
@@ -30,6 +30,7 @@ describe("useApiWorker", () => {
       expect(result.current).toHaveProperty("error");
       expect(typeof result.current.refetch).toBe("function");
       expect(typeof result.current.deleteCache).toBe("function");
+      expect(result.current).toHaveProperty("streamChunks");
     });
   });
 
@@ -191,6 +192,46 @@ describe("useApiWorker", () => {
         { timeout: WAIT_MS },
       );
       expect(result.current.data).toBeDefined();
+    });
+  });
+
+  describe("stream response", () => {
+    it("returns streamChunks incrementally before data Blob", async () => {
+      const cacheName = "useApiWorker-stream-" + Date.now();
+      const { result } = renderHook(() =>
+        useApiWorker({
+          cacheName,
+          request: {
+            url: "https://httpbin.org/stream-bytes/128",
+            method: "GET",
+            responseType: "stream",
+            streamChunkBatchSize: 1,
+          },
+          runMode: "manual",
+        }),
+      );
+
+      act(() => {
+        result.current.refetch();
+      });
+
+      await waitFor(
+        () => {
+          expect(result.current.streamChunks).toBeDefined();
+          expect(Array.isArray(result.current.streamChunks)).toBe(true);
+        },
+        { timeout: WAIT_MS },
+      );
+
+      await waitFor(
+        () => {
+          expect(result.current.loading).toBe(false);
+        },
+        { timeout: WAIT_MS },
+      );
+      expect(result.current.data).toBeDefined();
+      expect(Object.prototype.toString.call(result.current.data)).toBe("[object Blob]");
+      expect((result.current.data as Blob).size).toBe(128);
     });
   });
 
