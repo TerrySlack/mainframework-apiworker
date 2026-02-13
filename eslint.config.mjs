@@ -19,6 +19,7 @@ export default [
       "pnpm-lock.yaml",
       "package-lock.json",
       "yarn.lock",
+      "jest.worker-setup.ts",
     ],
   },
 
@@ -36,7 +37,7 @@ export default [
       parser: tseslint.parser,
       parserOptions: {
         // Make sure this path matches your repo
-        project: ["./tsconfig.json"],
+        project: ["./tsconfig.eslint.json"],
         //tsconfigRootDir: new URL(".", import.meta.url),
         tsconfigRootDir: process.cwd(),
         ecmaVersion: "latest",

@@ -1,11 +1,15 @@
 {
-  "transform": { "^.+\\.(t|j)sx?$": "<rootDir>/jest-import-meta-transform.cjs" },
+  "transform": {
+    "^.+\\.tsx?$": ["babel-jest", { "configFile": "./babel.config.cjs" }]
+  },
+  "moduleNameMapper": {
+    "@mainframework/is-deep-equal": "<rootDir>/jest-is-deep-equal-stub.cjs"
+  },
   "testRegex": "(/tests/.*|(\\.|/)(test|spec))\\.(jsx?|tsx?)$",
   "testPathIgnorePatterns": ["\\.rollup\\.cache"],
   "moduleFileExtensions": ["ts", "tsx", "js", "jsx", "json", "node"],
   "testEnvironment": "jsdom",
   "passWithNoTests": true,
   "setupFiles": ["<rootDir>/jest.worker-setup.ts"],
-  "globalTeardown": "<rootDir>/jest.global-teardown.cjs",
-  "moduleNameMapper": { "@mainframework/is-deep-equal": "<rootDir>/jest-is-deep-equal-stub.cjs" }
+  "globalTeardown": "<rootDir>/jest.global-teardown.cjs"
 }

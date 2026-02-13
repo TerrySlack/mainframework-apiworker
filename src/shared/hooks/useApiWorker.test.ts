@@ -7,12 +7,9 @@ const WAIT_MS = 15000;
 
 jest.setTimeout(25000);
 
-declare global {
-  var __WORKER_TERMINATE__: (() => Promise<void>) | undefined;
-}
-
 afterAll(async () => {
-  await globalThis.__WORKER_TERMINATE__?.();
+  const term = Reflect.get(globalThis, "__WORKER_TERMINATE__");
+  if (typeof term === "function") await term();
 });
 
 describe("useApiWorker", () => {

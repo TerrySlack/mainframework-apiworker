@@ -1,5 +1,6 @@
 // useApiWorker.ts
 import { useRef, useState, useCallback, useEffect } from "react";
+import { createApiWorker } from "../utils/createApiWorker";
 import { uniqueId } from "../utils/uniqueId";
 import type {
   BinaryResponseMeta,
@@ -17,7 +18,7 @@ import { useCustomCallback } from "./useCustomCallback";
 // MODULE-LEVEL WORKER & QUEUE
 // ============================================================================
 
-const apiWorker = new Worker(new URL("../workers/api/api.worker", import.meta.url));
+const apiWorker = createApiWorker();
 
 const STALE_ENTRY_MS = 5000;
 const CLEANUP_INTERVAL_MS = 30000;
@@ -29,7 +30,9 @@ const cleanupState = { isDeleting: false, lastRun: 0 };
 const runStaleEntryCleanup = (): void => {
   const now = Date.now();
   if (cleanupState.isDeleting || now < cleanupState.lastRun + CLEANUP_INTERVAL_MS) return;
+
   cleanupState.isDeleting = true;
+
   try {
     const keys = Object.keys(responseQueue);
     let i = 0;

@@ -1,6 +1,7 @@
 /**
  * Provides the real api.worker to the hook via global Worker.
  * Uses worker_threads + test-worker-bootstrap so the hook talks to the actual worker.
+ * pretest runs yarn build, so dist/api.worker.js always exists.
  */
 
 /// <reference types="node" />
@@ -45,9 +46,19 @@ function RealWorkerConstructor() {
   return realWorkerAdapter;
 }
 
-(globalThis as unknown as { Worker: typeof Worker }).Worker = RealWorkerConstructor as unknown as typeof Worker;
-(globalThis as unknown as { __FETCH_IS_STUB__?: boolean }).__FETCH_IS_STUB__ = false;
-
-(globalThis as unknown as { __WORKER_TERMINATE__?: () => Promise<void> }).__WORKER_TERMINATE__ = async () => {
+const RealWorker = RealWorkerConstructor as unknown as typeof Worker;
+const g =
+  typeof globalThis !== "undefined"
+    ? globalThis
+    : typeof global !== "undefined"
+      ? global
+      : typeof window !== "undefined"
+        ? window
+        : {};
+(g as { Worker?: typeof Worker }).Worker = RealWorker;
+if (typeof global !== "undefined") (global as { Worker?: typeof Worker }).Worker = RealWorker;
+if (typeof window !== "undefined") (window as { Worker?: typeof Worker }).Worker = RealWorker;
+(g as { __FETCH_IS_STUB__?: boolean }).__FETCH_IS_STUB__ = false;
+(g as { __WORKER_TERMINATE__?: () => Promise<void> }).__WORKER_TERMINATE__ = async () => {
   await nodeWorker.terminate();
 };

@@ -45,30 +45,34 @@ yarn add @mainframework/api-request-worker
 
 If you use the optional React hook, a peer dependency `react >= 19` is required.
 
+### Public imports only
+
+Use only these import paths. Do not import the worker script directly.
+
+| Use case    | Import from                               | What you get                                                                                                              |
+| ----------- | ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| **Vanilla** | `@mainframework/api-request-worker`       | `createApiWorker`, `RequestConfig`, `DataRequest`, `BinaryResponseMeta`, `WorkerMessagePayload`, and other protocol types |
+| **React**   | `@mainframework/api-request-worker/react` | `useApiWorker`, `RequestConfig`, hook types                                                                               |
+
+The worker is not a public entry. Obtain it only by calling `createApiWorker()` from the main package (or use the React hook, which uses `createApiWorker` internally).
+
 ---
 
 ## Usage with Vanilla TypeScript / JavaScript
 
-The core of this library is a Web Worker that you communicate with via the standard `postMessage` API. This approach works in any JavaScript environment—no framework required. You create a Worker instance from the package's built worker script, send **dataRequests** via `postMessage`, and handle responses in `onmessage`.
+Import from the main package entry and create the worker with `createApiWorker`. You then talk to the worker via the standard `postMessage` API: send **dataRequests** with `worker.postMessage`, and handle responses in `worker.onmessage`. No framework required.
 
 ### Setting Up the Worker
 
-**With a bundler (Vite, webpack, etc.):**
+Create the worker with `createApiWorker`. This is the only way to obtain the worker.
 
 ```ts
-const worker = new Worker(
-  new URL("node_modules/@mainframework/api-request-worker/dist/api.worker.js", import.meta.url),
-  { type: "module" },
-);
+import { createApiWorker } from "@mainframework/api-request-worker";
+
+const worker = createApiWorker();
 ```
 
-**Without a bundler:**
-
-Serve `node_modules/@mainframework/api-request-worker/dist/api.worker.js` from your web server and create the worker with that URL:
-
-```ts
-const worker = new Worker("/path/to/api.worker.js", { type: "module" });
-```
+Set `worker.onmessage` to handle responses (see [Message Protocol](#message-protocol)). Use the built-in `worker.postMessage` to send requests; do not overwrite `postMessage`.
 
 ### Message Protocol
 
@@ -143,7 +147,9 @@ interface RequestConfig {
 **GET request from API (JSON response):**
 
 ```ts
-const worker = new Worker(workerUrl, { type: "module" });
+import { createApiWorker } from "@mainframework/api-request-worker";
+
+const worker = createApiWorker();
 const cacheName = "api-get-" + Date.now();
 
 worker.onmessage = (event) => {
@@ -396,7 +402,7 @@ For React applications, the library provides an optional `useApiWorker` hook tha
 ### Hook API
 
 ```ts
-import { useApiWorker } from "@mainframework/api-request-worker";
+import { useApiWorker } from "@mainframework/api-request-worker/react";
 
 const result = useApiWorker({
   cacheName: "my-cache",       // required
@@ -623,48 +629,67 @@ Responses are routed to the requesting component by `cacheName` or, when `cacheN
 
 ## TypeScript Types
 
-**For React:**
+**Vanilla (main entry):** Request and protocol types:
 
 ```ts
-import type { RequestConfig, UseApiWorkerConfig, UseApiWorkerReturn } from "@mainframework/api-request-worker";
+import type {
+  RequestConfig,
+  DataRequest,
+  BinaryResponseMeta,
+  WorkerMessagePayload,
+  WorkerErrorPayload,
+  WorkerResponseMessage,
+  ResponseType,
+  RunMode,
+  WorkerDataRequestType,
+  WorkerMessageData,
+  BinaryParseResult,
+} from "@mainframework/api-request-worker";
 ```
 
-**For vanilla JavaScript/TypeScript:**
+- `WorkerDataRequestType`: `"get" | "set" | "delete" | "cancel"` — for narrowing `DataRequest.type`
+- `WorkerMessageData`: `{ dataRequest?: DataRequest }` — shape for `postMessage` payloads
+- `BinaryParseResult`: internal binary marker type; mainly for advanced worker extensions
 
-The worker expects the `dataRequest` shape described in the protocol documentation above. You can define minimal types for message payloads or reuse `RequestConfig` for the `request` field.
+**React:**
+
+```ts
+import type { RequestConfig, UseApiWorkerConfig, UseApiWorkerReturn } from "@mainframework/api-request-worker/react";
+```
 
 ---
 
 ## Quick Reference
 
-| Use case          | Entry point                      | Primary API                                                                                                                                                |
-| ----------------- | -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Vanilla JS/TS** | Worker from `dist/api.worker.js` | `worker.postMessage({ dataRequest: { type, cacheName, request?, payload?, ... } })` and `worker.onmessage` for responses                                   |
-| **React**         | Optional: `useApiWorker` hook    | `useApiWorker({ cacheName, request?, data?, runMode?, enabled? })` → `{ data, meta, loading, error, refetch, deleteCache }` (or use worker protocol above) |
+| Use case          | Entry point                               | Primary API                                                                                                                 |
+| ----------------- | ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| **Vanilla JS/TS** | `@mainframework/api-request-worker`       | `createApiWorker()`; set `worker.onmessage`, use `worker.postMessage`                                                       |
+| **React**         | `@mainframework/api-request-worker/react` | `useApiWorker({ cacheName, request?, data?, runMode?, enabled? })` → `{ data, meta, loading, error, refetch, deleteCache }` |
 
 ---
 
 ## Framework Integrations
 
-**Core:** The worker and message protocol work with any environment (vanilla JavaScript/TypeScript or any framework).
+**Core:** The worker and message protocol work in any environment (vanilla JavaScript/TypeScript or any framework). The worker is always created via `createApiWorker`; the vanilla bundle and the React hook both use it.
 
-**Optional integration:** A React hook (`useApiWorker`) is included to make adoption easier for React projects; React teams may instead integrate using the worker protocol directly.
+**React:** A hook (`useApiWorker`) is included; it uses `createApiWorker` internally and exposes a simple API. You can instead use the [Message Protocol](#message-protocol) from React with your own `createApiWorker()` instance.
 
-**Coming soon:** Idiomatic helpers for other frameworks (Angular, Vue, Preact, SolidJS) are planned; until then, use the protocol from those frameworks as with vanilla JS.
+**Other frameworks:** Use the main package entry and the protocol as with vanilla JS (Angular, Vue, Preact, SolidJS, etc.).
 
 ---
 
 ## Testing
 
-This library is thoroughly tested with comprehensive test suites:
+Three test suites cover the library:
 
-- React hook tests (`useApiWorker.test.ts`)
-- Worker protocol tests (`api.worker.test.ts`)
+- **createApiWorker** — `src/shared/utils/createApiWorker.test.ts` (worker creation)
+- **useApiWorker** — `src/shared/hooks/useApiWorker.test.ts` (React hook)
+- **Worker protocol** — `src/shared/workers/api/api.worker.test.ts` (message protocol and worker logic)
 
-Key behaviors and examples in this README are covered by the test suites.
+The behaviors and examples in this README are covered by these tests.
 
 ---
 
 ## License
 
-See the License file in the repo
+See LICENSE in the repository.

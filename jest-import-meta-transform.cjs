@@ -9,11 +9,14 @@ const tsJestTransformer = tsJest.createTransformer();
 const FAKE_URL = "'file:///fake-worker.js'";
 
 module.exports = {
-  process(src, filename, config, options) {
+  process(src, filename, transformOptions) {
     let source = src;
-    if (filename.includes("useApiWorker.ts") && source.includes("import.meta.url")) {
+    if (
+      (filename.includes("useApiWorker.ts") || filename.includes("createApiWorker.ts")) &&
+      source.includes("import.meta.url")
+    ) {
       source = source.replace(/import\.meta\.url/g, FAKE_URL);
     }
-    return tsJestTransformer.process(source, filename, config, options);
+    return tsJestTransformer.process(source, filename, transformOptions);
   },
 };

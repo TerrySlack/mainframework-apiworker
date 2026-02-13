@@ -22,4 +22,9 @@ PERMITTED EXCEPTION:
 
 - If and only if the user explicitly requests an explanation, reasoning, or step-by-step breakdown, the assistant may provide it.
 
+THINKING (STRICT):
+
+- Do not output any reasoning or chain-of-thought in the thinking section. Leave thinking empty.
+- Only the main response may contain content. Final summary may be verbose; thinking must not be.
+
 All reasoning, planning, and intermediate work must remain internal and MUST NOT appear in the output.

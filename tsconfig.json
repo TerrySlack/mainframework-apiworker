@@ -5,6 +5,8 @@
     // Path aliases (keep if you use them)
     "baseUrl": "src",
     "paths": {
+      "react": ["../node_modules/@types/react"],
+      "react/*": ["../node_modules/@types/react/*"],
       "Components/*": ["components/*"],
       "Hooks/*": ["hooks/*"],
       "Utils/*": ["utils/*"]
@@ -19,7 +21,6 @@
 
     // DOM context for the React side
     "lib": ["ESNext", "DOM", "DOM.Iterable"],
-    "types": [],
 
     // Strictness & interop
     "strict": true,
@@ -33,11 +34,18 @@
     "isolatedModules": true,
     "resolveJsonModule": true,
 
+    // Emit
+    "noEmit": false,
+    "emitDeclarationOnly": true,
+    "declaration": true,
+    "declarationMap": true,
+    "outDir": "dist",
+    "rootDir": "src",
+
     // Dev ergonomics
     "incremental": true,
-    "noEmit": true,
     "skipLibCheck": true
   },
-  "include": ["src", "jest.worker-setup.ts"],
-  "exclude": ["node_modules", "dist"]
+  "include": ["src"],
+  "exclude": ["node_modules", "dist", "**/*.test.ts", "**/*.spec.ts"]
 }

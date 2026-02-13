@@ -1,5 +1,3 @@
-import type { Dispatch, SetStateAction } from "react";
-
 /** When "binary" or "stream", in-flight dedupe is skipped so we always run the request and return real response (no stale). */
 export type ResponseType = "json" | "binary" | "stream";
 
@@ -71,7 +69,7 @@ export interface QueueEntry<T> {
   data: T | null;
   meta: BinaryResponseMeta | null;
   error: string | null;
-  setUpdateTrigger: Dispatch<SetStateAction<number>> | null;
+  setUpdateTrigger: ((value: number | ((prev: number) => number)) => void) | null;
   requestId: string | null;
   lastActivityAt: number | null;
 }

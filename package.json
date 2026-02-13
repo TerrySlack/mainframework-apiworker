@@ -3,15 +3,20 @@
   "version": "1.0.0",
   "description": "Offloads API requests and application state to a Web Worker to keep the UI thread fast.",
   "type": "module",
-  "main": "./dist/index.js",
+  "main": "./dist/shared/output/vanilla.js",
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js",
-      "default": "./dist/index.js"
+      "types": "./dist/shared/output/vanilla.d.ts",
+      "import": "./dist/shared/output/vanilla.js",
+      "default": "./dist/shared/output/vanilla.js"
+    },
+    "./react": {
+      "types": "./dist/shared/output/react.d.ts",
+      "import": "./dist/shared/output/react.js",
+      "default": "./dist/shared/output/react.js"
     }
   },
-  "types": "./dist/index.d.ts",
+  "types": "./dist/shared/output/vanilla.d.ts",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/TerrySlack/mainframework-apiworker.git"
@@ -24,13 +29,14 @@
     "husky-setup": "npx husky init",
     "husky": "husky",
     "prepare": "husky",
-    "clean": "rimraf dist tsconfig.build.tsbuildinfo",
+    "clean": "rimraf dist tsconfig.tsbuildinfo",
     "lint-staged": "lint-staged",
     "prebuild": "yarn husky && yarn clean",
-    "build": "yarn prebuild && rollup -c && tsc -p tsconfig.build.json --listEmittedFiles",
-    "test": "jest -c jestconfig.json --runInBand",
-    "test:watch": "jest -c jestconfig.json --watchAll --runInBand",
-    "test:coverage": "jest -c jestconfig.json --coverage --runInBand",
+    "build": "yarn prebuild && rollup -c && tsc",
+    "pretest": "yarn build",
+    "test": "jest -c jest.config.cjs --runInBand",
+    "test:watch": "jest -c jest.config.cjs --watchAll --runInBand",
+    "test:coverage": "jest -c jest.config.cjs --coverage --runInBand",
     "tscheck": "tsc"
   },
   "lint-staged": {
@@ -46,7 +52,7 @@
   },
   "peerDependenciesMeta": {
     "react": {
-      "optional": false
+      "optional": true
     }
   },
   "files": [
@@ -63,6 +69,9 @@
   "author": "Terry Slack",
   "license": "MIT",
   "devDependencies": {
+    "@babel/core": "^7.29.0",
+    "@babel/preset-env": "^7.29.0",
+    "@babel/preset-typescript": "^7.28.5",
     "@eslint/js": "^10.0.1",
     "@mainframework/is-deep-equal": "^1.0.9",
     "@rollup/plugin-node-resolve": "^16.0.3",
@@ -74,6 +83,7 @@
     "@types/react": "^19.2.14",
     "@typescript-eslint/eslint-plugin": "^8.55.0",
     "@typescript-eslint/parser": "^8.55.0",
+    "babel-plugin-transform-import-meta": "^2.3.3",
     "eslint": "10.0.0",
     "eslint-plugin-react": "^7.37.5",
     "eslint-plugin-react-hooks": "^7.0.1",
@@ -88,6 +98,7 @@
     "rimraf": "^6.1.2",
     "rollup": "^4.57.1",
     "ts-jest": "^29.4.6",
+    "tslib": "^2.8.1",
     "typescript": "^5.9.3",
     "typescript-eslint": "^8.55.0"
   }
