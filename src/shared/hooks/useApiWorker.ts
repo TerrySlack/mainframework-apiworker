@@ -15,12 +15,9 @@ type StreamAccumulator = { chunks: ArrayBuffer[]; meta: BinaryResponseMeta | nul
 
 type StreamThrottleState = {
   pendingChunks: ArrayBuffer[];
-  lastFlushTime: number;
-  timeoutId: ReturnType<typeof setTimeout> | null;
 };
 
 const DEFAULT_CHUNK_BATCH = 5;
-const DEFAULT_THROTTLE_MS = 50;
 
 const toNumber = (val: unknown, fallback: number): number =>
   typeof val === "number" && Number.isFinite(val) ? val : fallback;
@@ -55,7 +52,14 @@ const runStaleEntryCleanup = (): void => {
     while (i < keys.length) {
       const key = keys[i] as string;
       const entry = responseQueue[key];
-      if (entry && entry.data != null && entry.lastActivityAt != null && now - entry.lastActivityAt >= STALE_ENTRY_MS) {
+      const streamInProgress = streamThrottleState[key] != null || streamAccumulators[key] != null;
+      if (
+        entry &&
+        !streamInProgress &&
+        entry.data != null &&
+        entry.lastActivityAt != null &&
+        now - entry.lastActivityAt >= STALE_ENTRY_MS
+      ) {
         entry.loading = null;
         entry.data = null;
         entry.meta = null;
@@ -63,8 +67,6 @@ const runStaleEntryCleanup = (): void => {
         entry.setUpdateTrigger = null;
         entry.requestId = null;
         delete entry.streamChunks;
-        const throttleState = streamThrottleState[key];
-        if (throttleState?.timeoutId != null) clearTimeout(throttleState.timeoutId);
         delete streamThrottleState[key];
       }
       i++;
@@ -85,13 +87,8 @@ const updater = (n: number) => n + 1;
 const flushStreamBatch = (key: string, entry: QueueEntry<unknown>): void => {
   const state = streamThrottleState[key];
   if (!state || state.pendingChunks.length === 0) return;
-  if (state.timeoutId != null) {
-    clearTimeout(state.timeoutId);
-    state.timeoutId = null;
-  }
   entry.streamChunks = state.pendingChunks.slice();
   state.pendingChunks.length = 0;
-  state.lastFlushTime = Date.now();
   entry.setUpdateTrigger?.(updater);
 };
 
@@ -120,11 +117,10 @@ apiWorker.onmessage = (event: MessageEvent<WorkerMessagePayload>) => {
     const entry = findEntry(cacheName, hookId);
     if (!entry) return;
     const batchSize = toNumber(entry.streamChunkBatchSize, DEFAULT_CHUNK_BATCH);
-    const throttleMs = toNumber(entry.streamChunkThrottleMs, DEFAULT_THROTTLE_MS);
     switch (msg.stream) {
       case "start": {
         streamAccumulators[key] = { chunks: [], meta: msg.meta ?? null };
-        streamThrottleState[key] = { pendingChunks: [], lastFlushTime: Date.now(), timeoutId: null };
+        streamThrottleState[key] = { pendingChunks: [] };
         entry.streamChunks = [];
         entry.meta = msg.meta ?? null;
         entry.setUpdateTrigger?.(updater);
@@ -133,8 +129,7 @@ apiWorker.onmessage = (event: MessageEvent<WorkerMessagePayload>) => {
       case "resume":
         if (!streamAccumulators[key]) streamAccumulators[key] = { chunks: [], meta: msg.meta ?? null };
         else if (msg.meta) streamAccumulators[key].meta = msg.meta;
-        if (!streamThrottleState[key])
-          streamThrottleState[key] = { pendingChunks: [], lastFlushTime: Date.now(), timeoutId: null };
+        if (!streamThrottleState[key]) streamThrottleState[key] = { pendingChunks: [] };
         if (msg.meta) entry.meta = msg.meta ?? null;
         return;
       case "chunk": {
@@ -145,11 +140,6 @@ apiWorker.onmessage = (event: MessageEvent<WorkerMessagePayload>) => {
           throttle.pendingChunks.push(msg.data);
           if (throttle.pendingChunks.length >= batchSize) {
             flushStreamBatch(key, entry);
-          } else if (throttle.timeoutId == null) {
-            throttle.timeoutId = setTimeout(() => {
-              flushStreamBatch(key, entry);
-              throttle.timeoutId = null;
-            }, throttleMs);
           }
         }
         return;
@@ -158,7 +148,6 @@ apiWorker.onmessage = (event: MessageEvent<WorkerMessagePayload>) => {
         const acc = streamAccumulators[key];
         const throttle = streamThrottleState[key];
         if (throttle?.pendingChunks.length) flushStreamBatch(key, entry);
-        if (throttle?.timeoutId != null) clearTimeout(throttle.timeoutId);
         delete streamThrottleState[key];
         delete streamAccumulators[key];
         const errMsg = error?.message ?? "";
@@ -242,6 +231,7 @@ export const useApiWorker = <T>(config: UseApiWorkerConfig): UseApiWorkerReturn<
     }
   }, [cacheName]);
 
+  //This runs on every render, as the cleanup.  Look at the function, it's has an early return if cleanup is happening
   useEffect(() => {
     runStaleEntryCleanup();
   });
@@ -259,7 +249,6 @@ export const useApiWorker = <T>(config: UseApiWorkerConfig): UseApiWorkerReturn<
       const isStream = requestConfig.responseType?.toLowerCase() === "stream";
       if (isStream) {
         entry.streamChunkBatchSize = toNumber(requestConfig.streamChunkBatchSize, DEFAULT_CHUNK_BATCH);
-        entry.streamChunkThrottleMs = toNumber(requestConfig.streamChunkThrottleMs, DEFAULT_THROTTLE_MS);
       }
       const request =
         isStream && requestConfig.retries === undefined ? { ...requestConfig, retries: 3 } : requestConfig;
@@ -282,8 +271,7 @@ export const useApiWorker = <T>(config: UseApiWorkerConfig): UseApiWorkerReturn<
   if (shouldRun && !hasAlreadyRunOnce && !entry.loading) {
     doRequest();
   }
-
-  const ret: UseApiWorkerReturn<T> = {
+  return {
     data: (entry.data as T) ?? null,
     meta: entry.meta ?? null,
     loading: entry.loading ?? false,
@@ -292,5 +280,4 @@ export const useApiWorker = <T>(config: UseApiWorkerConfig): UseApiWorkerReturn<
     deleteCache,
     streamChunks: toStreamChunks(entry.streamChunks),
   };
-  return ret;
 };

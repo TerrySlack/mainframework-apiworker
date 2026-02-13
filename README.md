@@ -136,13 +136,12 @@ interface RequestConfig {
   formDataKey?: string; // FormData key for root payload when building multipart form data
   retries?: number; // For responseType "stream": retry attempts on connection loss (default: 3, max: 5)
   streamChunkBatchSize?: number; // For responseType "stream": flush to streamChunks every N chunks (default: 5)
-  streamChunkThrottleMs?: number; // For responseType "stream": flush to streamChunks at most every N ms (default: 50)
 }
 ```
 
 - **`responseType: "binary"`**: Use for complete binary files. The worker returns an `ArrayBuffer` and sets `meta.contentType` and `meta.contentDisposition` so you can construct a proper `Blob`: `new Blob([data], { type: meta?.contentType })`.
 
-- **`responseType: "stream"`**: Use for streaming audio/video or large files. The worker sends chunks incrementally. The hook returns `streamChunks` (batches of `ArrayBuffer[]`) as they arrive and a final `Blob` in `data` when complete. Throttling via `streamChunkBatchSize` (default 5) and `streamChunkThrottleMs` (default 50) minimizes re-renders. Supports automatic reconnection with configurable retries (default 3, max 5).
+- **`responseType: "stream"`**: Use for streaming audio/video or large files. The worker sends chunks incrementally. The hook returns `streamChunks` (batches of `ArrayBuffer[]`) as they arrive and a final `Blob` in `data` when complete. Batching via `streamChunkBatchSize` (default 5) controls how many chunks are delivered per update. Supports automatic reconnection with configurable retries (default 3, max 5).
 
 ### Vanilla JavaScript Examples
 
@@ -569,7 +568,6 @@ const { data, meta, loading, error, streamChunks } = useApiWorker({
     responseType: "stream",
     retries: 3, // Retry on connection loss (default 3, max 5)
     streamChunkBatchSize: 5, // Optional: flush every N chunks (default 5)
-    streamChunkThrottleMs: 50, // Optional: flush at most every N ms (default 50)
   },
   runMode: "auto",
 });

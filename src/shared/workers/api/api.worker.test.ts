@@ -1,62 +1,6 @@
 /// <reference types="jest" />
 /// <reference types="node" />
-import { Worker } from "worker_threads";
-import path from "path";
-
-const workerScriptPath = path.resolve(process.cwd(), "test-worker-bootstrap.mjs");
-const worker = new Worker(workerScriptPath);
-
-const send = (data: unknown): Promise<unknown> =>
-  new Promise((resolve, reject) => {
-    const handler = (payload: { msg?: unknown; error?: string }) => {
-      worker.off("message", handler);
-      if (payload.error) reject(new Error(payload.error));
-      else resolve(payload.msg);
-    };
-    worker.on("message", handler);
-    worker.postMessage({ dataRequest: data });
-    setTimeout(() => {
-      worker.off("message", handler);
-      reject(new Error("Timeout"));
-    }, 5000);
-  });
-
-const sendNoResponse = (data: unknown): Promise<void> => {
-  worker.postMessage({ dataRequest: data });
-  return new Promise((r) => setTimeout(r, 50));
-};
-
-const sendStream = (
-  data: unknown,
-  timeoutMs = 10000,
-): Promise<{ stream: string; data?: ArrayBuffer; meta?: unknown; error?: { message: string } }[]> =>
-  new Promise((resolve, reject) => {
-    const collected: { stream: string; data?: ArrayBuffer; meta?: unknown; error?: { message: string } }[] = [];
-    const handler = (payload: {
-      msg?: { stream?: string; data?: ArrayBuffer; meta?: unknown; error?: { message: string } };
-      error?: string;
-    }) => {
-      if (payload.error) {
-        worker.off("message", handler);
-        reject(new Error(payload.error));
-        return;
-      }
-      const m = payload.msg;
-      if (m && "stream" in m && m.stream) {
-        collected.push({ stream: m.stream, data: m.data, meta: m.meta, error: m.error });
-        if (m.stream === "end") {
-          worker.off("message", handler);
-          resolve(collected);
-        }
-      }
-    };
-    worker.on("message", handler);
-    worker.postMessage({ dataRequest: data });
-    setTimeout(() => {
-      worker.off("message", handler);
-      reject(new Error("Stream timeout"));
-    }, timeoutMs);
-  });
+import { worker, send, sendNoResponse, sendStream } from "./setup-worker-for-test";
 
 afterAll(async () => {
   await worker.terminate();
@@ -137,7 +81,7 @@ describe("api.worker", () => {
       const msg = (await send({
         type: "set",
         cacheName: "valid-key",
-        request: { url: "https://example.com", method: "POST" },
+        request: { url: "https://httpbin.org/post", method: "POST" },
         hookId: "h1",
       })) as { cacheName: string; data: null; error: { message: string } };
       expect(msg).toMatchObject({
@@ -292,6 +236,12 @@ describe("api.worker", () => {
       expect(messages[messages.length - 1].error?.message ?? "").toBe("");
       const chunks = messages.filter((m) => m.stream === "chunk");
       expect(chunks.length).toBeGreaterThanOrEqual(1);
+      for (const m of chunks) {
+        expect(m.data).toBeDefined();
+        expect((m.data as ArrayBuffer).byteLength).toBeGreaterThanOrEqual(1);
+      }
+      const middle = messages.slice(1, -1);
+      expect(middle.every((m) => m.stream === "chunk")).toBe(true);
     });
 
     it("streams audio URL in chunks (start, chunk(s), end)", async () => {

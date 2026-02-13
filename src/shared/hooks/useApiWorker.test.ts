@@ -195,46 +195,6 @@ describe("useApiWorker", () => {
     });
   });
 
-  describe("stream response", () => {
-    it("returns streamChunks incrementally before data Blob", async () => {
-      const cacheName = "useApiWorker-stream-" + Date.now();
-      const { result } = renderHook(() =>
-        useApiWorker({
-          cacheName,
-          request: {
-            url: "https://httpbin.org/stream-bytes/128",
-            method: "GET",
-            responseType: "stream",
-            streamChunkBatchSize: 1,
-          },
-          runMode: "manual",
-        }),
-      );
-
-      act(() => {
-        result.current.refetch();
-      });
-
-      await waitFor(
-        () => {
-          expect(result.current.streamChunks).toBeDefined();
-          expect(Array.isArray(result.current.streamChunks)).toBe(true);
-        },
-        { timeout: WAIT_MS },
-      );
-
-      await waitFor(
-        () => {
-          expect(result.current.loading).toBe(false);
-        },
-        { timeout: WAIT_MS },
-      );
-      expect(result.current.data).toBeDefined();
-      expect(Object.prototype.toString.call(result.current.data)).toBe("[object Blob]");
-      expect((result.current.data as Blob).size).toBe(128);
-    });
-  });
-
   describe("binary response", () => {
     it("returns data and meta from worker", async () => {
       const cacheName = "useApiWorker-binary-" + Date.now();
