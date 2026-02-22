@@ -29,7 +29,7 @@ The library supports three response types to handle different use cases:
 
 - **`responseType: "binary"`**: Full binary response is buffered in the worker and sent as an `ArrayBuffer` in a single message. Perfect for complete binary files like images, PDFs, or downloadable documents.
 
-- **`responseType: "stream"`**: Responses are streamed incrementally to the client. The worker sends chunks as they arrive (`start` → `chunk` → `chunk` → ... → `end`), enabling playback of audio/video streams to begin before the full file downloads. The React hook automatically accumulates chunks and returns a `Blob` when complete. For vanilla JavaScript, you handle stream events manually for maximum control.
+- **`responseType: "stream"`**: Responses are streamed incrementally to the client. The worker sends chunks as they arrive (`start` → `chunk` → `chunk` → ... → `end`), enabling playback of audio/video streams to begin before the full file downloads. The React hook returns `streamChunks` (batches of `ArrayBuffer[]`) as they arrive and a final `Blob` in `data` when complete. Throttling (default: every 5 chunks or 50ms) minimizes re-renders. For vanilla JavaScript, you handle stream events manually for maximum control.
 
 Binary and stream responses are not stored in the worker cache; only json/text responses are cached.
 
@@ -135,12 +135,13 @@ interface RequestConfig {
   formDataFileFieldName?: string; // FormData field name for File/Blob parts (default: "Files")
   formDataKey?: string; // FormData key for root payload when building multipart form data
   retries?: number; // For responseType "stream": retry attempts on connection loss (default: 3, max: 5)
+  streamChunkBatchSize?: number; // For responseType "stream": flush to streamChunks every N chunks (default: 5)
 }
 ```
 
 - **`responseType: "binary"`**: Use for complete binary files. The worker returns an `ArrayBuffer` and sets `meta.contentType` and `meta.contentDisposition` so you can construct a proper `Blob`: `new Blob([data], { type: meta?.contentType })`.
 
-- **`responseType: "stream"`**: Use for streaming audio/video or large files. The worker sends chunks incrementally. Supports automatic reconnection with configurable retries (default 3, max 5).
+- **`responseType: "stream"`**: Use for streaming audio/video or large files. The worker sends chunks incrementally. The hook returns `streamChunks` (batches of `ArrayBuffer[]`) as they arrive and a final `Blob` in `data` when complete. Batching via `streamChunkBatchSize` (default 5) controls how many chunks are delivered per update. Supports automatic reconnection with configurable retries (default 3, max 5).
 
 ### Vanilla JavaScript Examples
 
@@ -428,14 +429,15 @@ const result = useApiWorker({
 
 **Return value:**
 
-| Property      | Type                         | Description                                                                                                                           |
-| ------------- | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| `data`        | `T \| null`                  | Response body: JSON/text for `responseType: "json"`, `ArrayBuffer` for `responseType: "binary"`, `Blob` for `responseType: "stream"`. |
-| `meta`        | `BinaryResponseMeta \| null` | For binary and stream responses: `contentType`, `contentDisposition`.                                                                 |
-| `loading`     | `boolean`                    | `true` while a request is in flight.                                                                                                  |
-| `error`       | `string \| null`             | Error message when the request failed; `null` when there is no error. See [Errors](#errors).                                          |
-| `refetch`     | `() => void`                 | Re-runs the same logical request. See [Refetch semantics](#refetch-semantics).                                                        |
-| `deleteCache` | `() => void`                 | Tells the worker to delete the cache entry for this `cacheName`.                                                                      |
+| Property       | Type                         | Description                                                                                                                                   |
+| -------------- | ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `data`         | `T \| null`                  | Response body: JSON/text for `responseType: "json"`, `ArrayBuffer` for `responseType: "binary"`, `Blob` for `responseType: "stream"`.         |
+| `meta`         | `BinaryResponseMeta \| null` | For binary and stream responses: `contentType`, `contentDisposition`.                                                                         |
+| `loading`      | `boolean`                    | `true` while a request is in flight.                                                                                                          |
+| `error`        | `string \| null`             | Error message when the request failed; `null` when there is no error. See [Errors](#errors).                                                  |
+| `refetch`      | `() => void`                 | Re-runs the same logical request. See [Refetch semantics](#refetch-semantics).                                                                |
+| `deleteCache`  | `() => void`                 | Tells the worker to delete the cache entry for this `cacheName`.                                                                              |
+| `streamChunks` | `ArrayBuffer[] \| undefined` | For `responseType: "stream"`: batches of chunks as they arrive. Append to `MediaSource` or process incrementally. `undefined` for non-stream. |
 
 ### React Examples
 
@@ -558,20 +560,21 @@ const { data, meta, loading } = useApiWorker({
 **Streaming response (audio/video):**
 
 ```ts
-const { data, meta, loading, error } = useApiWorker({
+const { data, meta, loading, error, streamChunks } = useApiWorker({
   cacheName: "video-stream",
   request: {
     url: "https://example.com/video.mp4",
     method: "GET",
     responseType: "stream",
     retries: 3, // Retry on connection loss (default 3, max 5)
+    streamChunkBatchSize: 5, // Optional: flush every N chunks (default 5)
   },
   runMode: "auto",
 });
 
-// data is a Blob when the stream completes
-// loading is true until stream ends
-// Use with media elements:
+// streamChunks: batches of ArrayBuffer[] as chunks arrive (append to MediaSource, etc.)
+// data: Blob when the stream completes
+// loading: true until stream ends
 // const videoUrl = data ? URL.createObjectURL(data) : null;
 // <video src={videoUrl} controls />
 ```
@@ -680,13 +683,11 @@ import type { RequestConfig, UseApiWorkerConfig, UseApiWorkerReturn } from "@mai
 
 ## Testing
 
-Three test suites cover the library:
+Tests use Vitest in browser mode (Playwright Chromium). The worker is created inside `useApiWorker`; there are no mocks.
 
-- **createApiWorker** — `src/shared/utils/createApiWorker.test.ts` (worker creation)
-- **useApiWorker** — `src/shared/hooks/useApiWorker.test.ts` (React hook)
-- **Worker protocol** — `src/shared/workers/api/api.worker.test.ts` (message protocol and worker logic)
+- **useApiWorker** — `src/shared/hooks/useApiWorker.test.ts` (React hook, real Worker and network)
 
-The behaviors and examples in this README are covered by these tests.
+Run tests: `yarn test` (or `yarn test:watch`, `yarn test:coverage`). Ensure Chromium is installed: `npx playwright install chromium`.
 
 ---
 
