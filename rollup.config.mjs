@@ -11,8 +11,7 @@ export default {
   output: {
     dir: "dist",
     format: "esm",
-    entryFileNames: (chunkInfo) =>
-      chunkInfo.name === "api.worker" ? "[name].js" : "shared/output/[name].js",
+    entryFileNames: "shared/output/[name].js",
     sourcemap: true,
   },
   plugins: [

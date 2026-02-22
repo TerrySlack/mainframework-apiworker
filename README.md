@@ -683,13 +683,11 @@ import type { RequestConfig, UseApiWorkerConfig, UseApiWorkerReturn } from "@mai
 
 ## Testing
 
-Three test suites cover the library:
+Tests use Vitest in browser mode (Playwright Chromium). The worker is created inside `useApiWorker`; there are no mocks.
 
-- **createApiWorker** — `src/shared/utils/createApiWorker.test.ts` (worker creation)
-- **useApiWorker** — `src/shared/hooks/useApiWorker.test.ts` (React hook)
-- **Worker protocol** — `src/shared/workers/api/api.worker.test.ts` (message protocol and worker logic)
+- **useApiWorker** — `src/shared/hooks/useApiWorker.test.ts` (React hook, real Worker and network)
 
-The behaviors and examples in this README are covered by these tests.
+Run tests: `yarn test` (or `yarn test:watch`, `yarn test:coverage`). Ensure Chromium is installed: `npx playwright install chromium`.
 
 ---
 
