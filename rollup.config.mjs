@@ -1,8 +1,9 @@
 import resolve from "@rollup/plugin-node-resolve";
-import typescript from "@rollup/plugin-typescript";
+import esbuild from "rollup-plugin-esbuild";
 import replace from "@rollup/plugin-replace";
+import { dts } from "rollup-plugin-dts";
 
-export default {
+const jsConfig = {
   input: {
     vanilla: "src/shared/output/vanilla.ts",
     react: "src/shared/output/react.ts",
@@ -11,21 +12,42 @@ export default {
   output: {
     dir: "dist",
     format: "esm",
-    entryFileNames: "shared/output/[name].js",
+    entryFileNames: (chunkInfo) =>
+      chunkInfo.name === "api.worker"
+        ? "workers/api/api.worker.js"
+        : "shared/output/[name].js",
     sourcemap: true,
   },
   plugins: [
     replace({
       preventAssignment: true,
       values: {
-        // Strip "use client" - module level directives cause errors when bundled
         '"use client";': "",
       },
     }),
-    resolve(),
-    typescript({
+    esbuild({
+      include: /\.[jt]sx?$/,
       tsconfig: "tsconfig.rollup.json",
     }),
+    resolve(),
   ],
   external: ["react"],
 };
+
+const dtsConfig = {
+  input: {
+    vanilla: "src/shared/output/vanilla.ts",
+    react: "src/shared/output/react.ts",
+  },
+  output: {
+    dir: "dist",
+    entryFileNames: "shared/output/[name].d.ts",
+  },
+  plugins: [
+    dts({
+      tsconfig: "tsconfig.rollup.json",
+    }),
+  ],
+};
+
+export default [jsConfig, dtsConfig];
