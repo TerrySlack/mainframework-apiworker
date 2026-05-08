@@ -3,13 +3,12 @@
     "allowJs": false,
 
     // Path aliases (keep if you use them)
-    "baseUrl": "src",
     "paths": {
       "react": ["../node_modules/@types/react"],
       "react/*": ["../node_modules/@types/react/*"],
-      "Components/*": ["components/*"],
-      "Hooks/*": ["hooks/*"],
-      "Utils/*": ["utils/*"]
+      "Components/*": ["./src/components/*"],
+      "Hooks/*": ["./src/hooks/*"],
+      "Utils/*": ["./src/utils/*"]
     },
 
     // Modern ESM + bundler-aware resolution

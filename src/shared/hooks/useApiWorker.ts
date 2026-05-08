@@ -1,5 +1,5 @@
 // useApiWorker.ts
-import { useRef, useState, useCallback, useEffect } from "react";
+import { useRef, useState, useCallback } from "react";
 import { createApiWorker } from "../utils/createApiWorker";
 import { uniqueId } from "../utils/uniqueId";
 import type {
@@ -31,7 +31,9 @@ import { useCustomCallback } from "./useCustomCallback";
 // MODULE-LEVEL WORKER & QUEUE
 // ============================================================================
 
-const apiWorker = createApiWorker();
+let apiWorker: Worker | null = null;
+let workerInitialized = false;
+let cleanupTimer: ReturnType<typeof setInterval> | null = null;
 
 const STALE_ENTRY_MS = 5000;
 const CLEANUP_INTERVAL_MS = 30000;
@@ -104,83 +106,101 @@ const finalizeEntry = (entry: QueueEntry<unknown>): void => {
   entry.setUpdateTrigger?.(updater);
 };
 
-// Worker always sends error ({ message: string }). Entry is found by cacheName or hookId.
-// Stream responses: start → chunk(s) → end; we accumulate chunks then set data = new Blob(chunks) on end.
-apiWorker.onmessage = (event: MessageEvent<WorkerMessagePayload>) => {
-  const msg = event.data;
-  const cacheName = msg.cacheName;
-  const hookId = msg.hookId;
-  const error = msg.error;
-  const key = cacheName ? normalizeKey(cacheName) : "";
+const getApiWorker = (): Worker => {
+  if (apiWorker) return apiWorker;
+  apiWorker = createApiWorker();
+  return apiWorker;
+};
 
-  if ("stream" in msg && msg.stream) {
-    const entry = findEntry(cacheName, hookId);
-    if (!entry) return;
-    const batchSize = toNumber(entry.streamChunkBatchSize, DEFAULT_CHUNK_BATCH);
-    switch (msg.stream) {
-      case "start": {
-        streamAccumulators[key] = { chunks: [], meta: msg.meta ?? null };
-        streamThrottleState[key] = { pendingChunks: [] };
-        entry.streamChunks = [];
-        entry.meta = msg.meta ?? null;
-        entry.setUpdateTrigger?.(updater);
-        return;
-      }
-      case "resume":
-        if (!streamAccumulators[key]) streamAccumulators[key] = { chunks: [], meta: msg.meta ?? null };
-        else if (msg.meta) streamAccumulators[key].meta = msg.meta;
-        if (!streamThrottleState[key]) streamThrottleState[key] = { pendingChunks: [] };
-        if (msg.meta) entry.meta = msg.meta ?? null;
-        return;
-      case "chunk": {
-        const acc = streamAccumulators[key];
-        const throttle = streamThrottleState[key];
-        if (acc && msg.data) acc.chunks.push(msg.data);
-        if (throttle && msg.data) {
-          throttle.pendingChunks.push(msg.data);
-          if (throttle.pendingChunks.length >= batchSize) {
-            flushStreamBatch(key, entry);
+const ensureWorkerInitialized = (): Worker => {
+  const worker = getApiWorker();
+  if (workerInitialized) return worker;
+  workerInitialized = true;
+
+  if (!cleanupTimer) {
+    cleanupTimer = setInterval(() => runStaleEntryCleanup(), CLEANUP_INTERVAL_MS);
+  }
+
+  // Worker always sends error ({ message: string }). Entry is found by cacheName or hookId.
+  // Stream responses: start → chunk(s) → end; we accumulate chunks then set data = new Blob(chunks) on end.
+  worker.onmessage = (event: MessageEvent<WorkerMessagePayload>) => {
+    const msg = event.data;
+    const cacheName = msg.cacheName;
+    const hookId = msg.hookId;
+    const error = msg.error;
+    const key = cacheName ? normalizeKey(cacheName) : "";
+
+    if ("stream" in msg && msg.stream) {
+      const entry = findEntry(cacheName, hookId);
+      if (!entry) return;
+      const batchSize = toNumber(entry.streamChunkBatchSize, DEFAULT_CHUNK_BATCH);
+      switch (msg.stream) {
+        case "start": {
+          streamAccumulators[key] = { chunks: [], meta: msg.meta ?? null };
+          streamThrottleState[key] = { pendingChunks: [] };
+          entry.streamChunks = [];
+          entry.meta = msg.meta ?? null;
+          entry.setUpdateTrigger?.(updater);
+          return;
+        }
+        case "resume":
+          if (!streamAccumulators[key]) streamAccumulators[key] = { chunks: [], meta: msg.meta ?? null };
+          else if (msg.meta) streamAccumulators[key].meta = msg.meta;
+          if (!streamThrottleState[key]) streamThrottleState[key] = { pendingChunks: [] };
+          if (msg.meta) entry.meta = msg.meta ?? null;
+          return;
+        case "chunk": {
+          const acc = streamAccumulators[key];
+          const throttle = streamThrottleState[key];
+          if (acc && msg.data) acc.chunks.push(msg.data);
+          if (throttle && msg.data) {
+            throttle.pendingChunks.push(msg.data);
+            if (throttle.pendingChunks.length >= batchSize) {
+              flushStreamBatch(key, entry);
+            }
           }
+          return;
         }
-        return;
-      }
-      case "end": {
-        const acc = streamAccumulators[key];
-        const throttle = streamThrottleState[key];
-        if (throttle?.pendingChunks.length) flushStreamBatch(key, entry);
-        delete streamThrottleState[key];
-        delete streamAccumulators[key];
-        const errMsg = error?.message ?? "";
-        if (errMsg !== "") {
-          entry.error = errMsg;
-        } else if (acc) {
-          entry.data = new Blob(acc.chunks, acc.meta?.contentType ? { type: acc.meta.contentType } : undefined);
-          entry.meta = acc.meta ?? null;
-          entry.error = null;
-          entry.lastActivityAt = Date.now();
+        case "end": {
+          const acc = streamAccumulators[key];
+          const throttle = streamThrottleState[key];
+          if (throttle?.pendingChunks.length) flushStreamBatch(key, entry);
+          delete streamThrottleState[key];
+          delete streamAccumulators[key];
+          const errMsg = error?.message ?? "";
+          if (errMsg !== "") {
+            entry.error = errMsg;
+          } else if (acc) {
+            entry.data = new Blob(acc.chunks, acc.meta?.contentType ? { type: acc.meta.contentType } : undefined);
+            entry.meta = acc.meta ?? null;
+            entry.error = null;
+            entry.lastActivityAt = Date.now();
+          }
+          entry.loading = false;
+          finalizeEntry(entry);
+          return;
         }
-        entry.loading = false;
-        finalizeEntry(entry);
-        return;
       }
     }
-  }
 
-  const entry = findEntry(cacheName, hookId);
-  if (!entry) return;
+    const entry = findEntry(cacheName, hookId);
+    if (!entry) return;
 
-  const message = error?.message ?? "";
-  if (message !== "") {
-    entry.error = message;
-    entry.loading = false;
-  } else {
-    entry.data = msg.data ?? null;
-    entry.meta = msg.meta ?? null;
-    entry.lastActivityAt = Date.now();
-    entry.error = null;
-    entry.loading = false;
-  }
-  finalizeEntry(entry);
+    const message = error?.message ?? "";
+    if (message !== "") {
+      entry.error = message;
+      entry.loading = false;
+    } else {
+      entry.data = msg.data ?? null;
+      entry.meta = msg.meta ?? null;
+      entry.lastActivityAt = Date.now();
+      entry.error = null;
+      entry.loading = false;
+    }
+    finalizeEntry(entry);
+  };
+
+  return worker;
 };
 
 // ============================================================================
@@ -191,6 +211,8 @@ export type { RequestConfig, UseApiWorkerConfig, UseApiWorkerReturn } from "../t
 
 export const useApiWorker = <T>(config: UseApiWorkerConfig): UseApiWorkerReturn<T> => {
   const { cacheName, request: requestConfig, data: configData, runMode = "auto", enabled = true } = config;
+
+  const worker = ensureWorkerInitialized();
 
   const hookIdRef = useRef<string>("");
   const queueKey = normalizeKey(cacheName);
@@ -225,16 +247,11 @@ export const useApiWorker = <T>(config: UseApiWorkerConfig): UseApiWorkerReturn<
 
   const deleteCache = useCallback(() => {
     if (cacheName) {
-      apiWorker.postMessage({
+      worker.postMessage({
         dataRequest: { type: "delete", cacheName, hookId: hookIdRef.current },
       });
     }
-  }, [cacheName]);
-
-  //This runs on every render, as the cleanup.  Look at the function, it's has an early return if cleanup is happening
-  useEffect(() => {
-    runStaleEntryCleanup();
-  });
+  }, [cacheName, worker]);
 
   const doRequest = useCallback(() => {
     const entry = responseQueue[queueKey];
@@ -252,14 +269,14 @@ export const useApiWorker = <T>(config: UseApiWorkerConfig): UseApiWorkerReturn<
       }
       const request =
         isStream && requestConfig.retries === undefined ? { ...requestConfig, retries: 3 } : requestConfig;
-      apiWorker.postMessage({
+      worker.postMessage({
         dataRequest: { type: "set", cacheName, hookId, requestId, payload: configData, request },
       });
     } else {
-      apiWorker.postMessage({ dataRequest: { type: "get", cacheName, hookId } as DataRequest<unknown> });
+      worker.postMessage({ dataRequest: { type: "get", cacheName, hookId } as DataRequest<unknown> });
     }
     hasExecutedRef.current = true;
-  }, [queueKey, cacheName, hookId, requestConfig, configData]);
+  }, [queueKey, cacheName, hookId, requestConfig, configData, worker]);
 
   const makeRequest = useCustomCallback(() => {
     if (!enabled || (runMode === "once" && hasExecutedRef.current)) return;

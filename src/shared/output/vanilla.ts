@@ -11,4 +11,5 @@ export type {
   WorkerDataRequestType,
   WorkerMessageData,
   BinaryParseResult,
+  ContentType,
 } from "../types/types";

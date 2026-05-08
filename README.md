@@ -45,6 +45,58 @@ yarn add @mainframework/api-request-worker
 
 If you use the optional React hook, a peer dependency `react >= 19` is required.
 
+---
+
+## Quickstart
+
+### React
+
+```ts
+import { useApiWorker } from "@mainframework/api-request-worker/react";
+
+export function Todos() {
+  const { data, loading, error, refetch } = useApiWorker<{ id: string; title: string }[]>({
+    cacheName: "todos",
+    request: { url: "https://api.example.com/todos", method: "GET" },
+    runMode: "auto",
+  });
+
+  if (loading) return null;
+  if (error) return null;
+
+  return (
+    <div>
+      <button onClick={refetch}>Refresh</button>
+      <pre>{JSON.stringify(data, null, 2)}</pre>
+    </div>
+  );
+}
+```
+
+### Vanilla JS/TS
+
+```ts
+import { createApiWorker } from "@mainframework/api-request-worker";
+
+const worker = createApiWorker();
+const cacheName = "todos";
+
+worker.onmessage = (event) => {
+  const msg = event.data;
+  if (msg.cacheName !== cacheName) return;
+  if (msg.error?.message) throw new Error(msg.error.message);
+  console.log(msg.data);
+};
+
+worker.postMessage({
+  dataRequest: {
+    type: "set",
+    cacheName,
+    request: { url: "https://api.example.com/todos", method: "GET" },
+  },
+});
+```
+
 ### Public imports only
 
 Use only these import paths. Do not import the worker script directly.
@@ -55,6 +107,18 @@ Use only these import paths. Do not import the worker script directly.
 | **React**   | `@mainframework/api-request-worker/react` | `useApiWorker`, `RequestConfig`, hook types                                                                               |
 
 The worker is not a public entry. Obtain it only by calling `createApiWorker()` from the main package (or use the React hook, which uses `createApiWorker` internally).
+
+---
+
+## Bundler notes (Vite / Webpack / Next.js)
+
+- **Vite**: Works out of the box. The worker is created via `new Worker(new URL(..., import.meta.url), { type: "module" })`.
+
+- **Webpack**: Must support ESM module workers. Ensure your build supports `new URL(..., import.meta.url)` for assets and that module workers are enabled.
+
+- **Next.js**: Use **client-only** code paths.
+  - Add `"use client";` at the top of any file that imports `@mainframework/api-request-worker/react`.
+  - Do not call `createApiWorker()` during SSR.
 
 ---
 
@@ -647,6 +711,7 @@ import type {
   WorkerDataRequestType,
   WorkerMessageData,
   BinaryParseResult,
+  ContentType,
 } from "@mainframework/api-request-worker";
 ```
 
