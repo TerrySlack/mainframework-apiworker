@@ -13,8 +13,9 @@ import type {
 export const BINARY_MARKER = Symbol.for("WorkerApiBinary");
 
 const DEFAULT_FILES_FIELD = "Files";
-
+const EMPTY_BUFFER = new ArrayBuffer(0);
 const NO_ERROR: WorkerErrorPayload = { message: "" };
+const DEFAULT_ERROR = "An error occurred";
 
 const callerResponse = (
   cacheName: string,
@@ -47,7 +48,7 @@ const callerResponseBinary = (
   httpStatus?: number,
   error: WorkerErrorPayload = NO_ERROR,
 ): void => {
-  const buffer = data?.byteLength ? data : new ArrayBuffer(0);
+  const buffer = data.byteLength ? data : EMPTY_BUFFER;
   const payload = { cacheName, data: buffer, meta, hookId, httpStatus, error };
   self.postMessage(payload, buffer.byteLength > 0 ? [buffer] : []);
 };
@@ -59,7 +60,14 @@ const callerResponseStreamStart = (
   httpStatus?: number,
   error: WorkerErrorPayload = NO_ERROR,
 ): void => {
-  self.postMessage({ cacheName, stream: "start", meta, hookId, httpStatus, error });
+  self.postMessage({
+    cacheName,
+    stream: "start",
+    meta,
+    hookId,
+    httpStatus,
+    error,
+  });
 };
 
 const callerResponseStreamResume = (
@@ -69,7 +77,14 @@ const callerResponseStreamResume = (
   httpStatus?: number,
   error: WorkerErrorPayload = NO_ERROR,
 ): void => {
-  self.postMessage({ cacheName, stream: "resume", meta, hookId, httpStatus, error });
+  self.postMessage({
+    cacheName,
+    stream: "resume",
+    meta,
+    hookId,
+    httpStatus,
+    error,
+  });
 };
 
 const callerResponseStreamChunk = (
@@ -78,7 +93,7 @@ const callerResponseStreamChunk = (
   hookId?: string | null,
   error: WorkerErrorPayload = NO_ERROR,
 ): void => {
-  const buffer = data?.byteLength ? data : new ArrayBuffer(0);
+  const buffer = data.byteLength ? data : EMPTY_BUFFER;
   const payload = { cacheName, stream: "chunk", data: buffer, hookId, error };
   self.postMessage(payload, buffer.byteLength > 0 ? [buffer] : []);
 };
@@ -127,7 +142,7 @@ const commit = <TData>(cacheName: string, data: TData, hookId?: string | null, h
     callerResponse("", null, hookId, undefined, makeError("Invalid commit: cacheName is required"));
     return;
   }
-  set(normalizeKey(cacheName), data);
+  set(cacheName, data); // set() normalizes internally - avoid double-normalizing here
   callerResponse(cacheName, data, hookId, httpStatus);
 };
 
@@ -144,9 +159,15 @@ const parseResponseByContentType = async (response: Response): Promise<unknown> 
     return null;
   }
 
-  // JSON types - let it throw if malformed
+  // JSON types - read as text first since chunked responses (no Content-Length) can still be
+  // empty; parsing "" directly with response.json() throws even though an empty JSON body is
+  // a legitimate, recoverable case rather than a real parse failure.
   if (contentType.includes("json")) {
-    return await response.json();
+    const text = await response.text();
+    if (text.trim() === "") {
+      return null;
+    }
+    return JSON.parse(text);
   }
 
   // Text-based types
@@ -205,24 +226,23 @@ const appendToFormData = (
     let ki = 0;
     while (ki < keys.length) {
       const k = keys[ki] as string;
-      if (Object.prototype.hasOwnProperty.call(value, k)) {
-        hasFile =
-          appendToFormData(
-            formData,
-            key ? `${key}.${k}` : k,
-            (value as Record<string, unknown>)[k],
-            fileFieldName,
-            set,
-          ) || hasFile;
-      }
+      hasFile =
+        appendToFormData(
+          formData,
+          key ? `${key}.${k}` : k,
+          (value as Record<string, unknown>)[k],
+          fileFieldName,
+          set,
+        ) || hasFile;
+
       ki++;
     }
     return hasFile;
   }
 
   if (value !== undefined && value !== null) {
-    const primitive = value as string | number | boolean | bigint | symbol;
-    formData.append(key, primitive as string | Blob);
+    const primitive = value as string | number | boolean | bigint;
+    formData.append(key, String(primitive));
   }
   return false;
 };
@@ -265,11 +285,49 @@ const getPayloadType = (payload: unknown): string => {
 };
 
 const buildJsonBody = (payload: unknown): BodyInit => JSON.stringify(payload);
-const buildUrlEncodedBody = (payload: Record<string, string>): BodyInit => new URLSearchParams(payload).toString();
+
+/**
+ * Builds a URL-encoded body from a flat object. Values must be primitives (string/number/boolean) -
+ * nested objects/arrays cannot be represented and throw rather than silently serializing to
+ * "[object Object]". null/undefined values are skipped.
+ */
+const buildUrlEncodedBody = (payload: Record<string, unknown>): BodyInit => {
+  const params = new URLSearchParams();
+  const keys = Object.keys(payload);
+  let i = 0;
+  while (i < keys.length) {
+    const key = keys[i] as string;
+    const value = payload[key];
+    if (value !== null && value !== undefined) {
+      if (typeof value === "object") {
+        throw new Error(`Cannot url-encode non-primitive value for key "${key}"`);
+      }
+      //params.append(key, String(value as string | number | boolean | bigint));
+      // params.append(key, String(value));
+      params.append(key, (value as string | number | boolean | bigint).toString());
+    }
+    i++;
+  }
+  return params.toString();
+};
+
 const buildTextBody = (payload: unknown): BodyInit => String(payload);
 
 /**
  * Builds body and headers for fetch. Each branch handles one payload type; add new cases here for new body types.
+ *
+ * Object payloads are always checked for nested File/Blob values first (createFormDataIfBlobOrFile).
+ * If any are found, the request is automatically sent as multipart/form-data and any Content-Type
+ * header the caller passed in is overwritten/omitted - the browser must set its own Content-Type
+ * (including the multipart boundary) for the body to be parsed correctly server-side. Callers no
+ * longer need to manually set Content-Type: multipart/form-data to get file uploads to work; it is
+ * detected automatically, including files nested arbitrarily deep in the payload (e.g.
+ * { photos: File[], videos: File[] }). Every File/Blob found is appended under the same
+ * fileFieldName (default "Files", override via formDataFileFieldName) regardless of which property
+ * it came from - this matches the common API convention of collecting all uploaded files under one
+ * repeated field name. If a caller does pass Content-Type: multipart/form-data but the payload has
+ * no actual File/Blob in it, we fall back to JSON and correct the header rather than sending a JSON
+ * body mislabeled as multipart.
  */
 const prepareRequestBody = (
   payload: unknown,
@@ -280,7 +338,10 @@ const prepareRequestBody = (
 
   switch (payloadType) {
     case "formdata":
-      return { body: payload as FormData, headers: omitContentType({ ...headers }) };
+      return {
+        body: payload as FormData,
+        headers: omitContentType({ ...headers }),
+      };
     case "blob":
       return { body: payload as Blob, headers: { ...headers } };
     case "arraybuffer":
@@ -288,29 +349,40 @@ const prepareRequestBody = (
     case "arraybufferview":
       return { body: payload as BodyInit, headers: { ...headers } };
     case "stream":
-      return { body: payload as ReadableStream<Uint8Array>, headers: { ...headers } };
+      return {
+        body: payload as ReadableStream<Uint8Array>,
+        headers: { ...headers },
+      };
     case "string":
       return { body: payload as string, headers: { ...headers } };
     case "object": {
-      const h = { ...headers };
-      const contentType = getContentType(h);
       const fileFieldName = options?.formDataFileFieldName ?? DEFAULT_FILES_FIELD;
       const formDataKey = options?.formDataKey ?? DEFAULT_FILES_FIELD;
 
+      // Auto-detect File/Blob anywhere in the payload (including nested, e.g. { photos: File[] }).
+      // If found, always send as multipart/form-data - Content-Type is omitted so the browser
+      // sets it itself (including the boundary).
+      const formData = createFormDataIfBlobOrFile(payload, fileFieldName, formDataKey);
+      if (formData) {
+        return { body: formData, headers: omitContentType({ ...headers }) };
+      }
+
+      const h = { ...headers };
+      let contentType = getContentType(h);
+
+      // No File/Blob found: a declared multipart/form-data would produce an invalid body
+      // (JSON string labeled as multipart), so fall back to JSON and fix the header.
+      if (contentType.includes("multipart/form-data")) {
+        contentType = "application/json";
+        delete h["Content-Type"];
+        delete h["content-type"];
+      }
+
       let body: BodyInit;
-      if (contentType.includes("application/json")) {
-        body = buildJsonBody(payload);
-      } else if (contentType.includes("application/x-www-form-urlencoded")) {
-        body = buildUrlEncodedBody(payload as Record<string, string>);
+      if (contentType.includes("application/x-www-form-urlencoded")) {
+        body = buildUrlEncodedBody(payload as Record<string, unknown>);
       } else if (contentType.startsWith("text/") || contentType.includes("xml")) {
         body = buildTextBody(payload);
-      } else if (contentType.includes("multipart/form-data")) {
-        const formData = createFormDataIfBlobOrFile(payload, fileFieldName, formDataKey);
-        if (formData) {
-          return { body: formData, headers: omitContentType(h) };
-        }
-        body = buildJsonBody(payload);
-        h["Content-Type"] = "application/json";
       } else {
         body = buildJsonBody(payload);
       }
@@ -355,6 +427,10 @@ const apiRequest = async <TData>(
   if (!skipInFlightDedupe) {
     const existing = inFlightByCacheName.get(cacheName);
     if (existing) {
+      // Joining an in-flight request by cacheName: this caller does not get its own
+      // AbortController registered (only the original request's requestId is tracked in
+      // inFlightControllers below), so calling cancel with this caller's requestId is a no-op -
+      // the original in-flight request keeps running for whoever else is awaiting it too.
       const cached = get(cacheName);
       if (cached !== undefined) callerResponse(cacheName, cached, hookId);
       await existing;
@@ -382,19 +458,27 @@ const apiRequest = async <TData>(
       signal: controller.signal,
     };
 
-    if (methodLower !== "get" && payload != null) {
-      const prepareOptions: { formDataFileFieldName?: string; formDataKey?: string } = {};
-      if (formDataFileFieldName != null && formDataFileFieldName !== "")
-        prepareOptions.formDataFileFieldName = formDataFileFieldName;
-      if (formDataKey != null && formDataKey !== "") prepareOptions.formDataKey = formDataKey;
-      const { body, headers: processedHeaders } = prepareRequestBody(payload, headers, prepareOptions);
-      if (body !== undefined) fetchOptions.body = body;
-      fetchOptions.headers = processedHeaders;
-    } else {
-      fetchOptions.headers = omitContentType({ ...headers });
-    }
-
     try {
+      if (methodLower !== "get" && payload != null) {
+        const prepareOptions: {
+          formDataFileFieldName?: string;
+          formDataKey?: string;
+        } = {};
+        if (formDataFileFieldName != null && formDataFileFieldName !== "")
+          prepareOptions.formDataFileFieldName = formDataFileFieldName;
+        if (formDataKey != null && formDataKey !== "") prepareOptions.formDataKey = formDataKey;
+        // Body preparation (JSON.stringify, FormData building, url-encoding) can throw
+        // synchronously (e.g. circular references, non-primitive url-encoded values). This must
+        // stay inside the try/catch below - a throw here previously rejected this IIFE with no
+        // handler, left the caller waiting on a postMessage that never arrives, and skipped the
+        // finally block, permanently leaking this cacheName/requestId from the in-flight maps.
+        const { body, headers: processedHeaders } = prepareRequestBody(payload, headers, prepareOptions);
+        if (body !== undefined) fetchOptions.body = body;
+        fetchOptions.headers = processedHeaders;
+      } else {
+        fetchOptions.headers = omitContentType({ ...headers });
+      }
+
       if (responseTypeLower === "stream") {
         const maxRetries = Math.min(retries ?? 3, 5);
         let bytesReceived = 0;
@@ -403,11 +487,14 @@ const apiRequest = async <TData>(
         while (attempt <= maxRetries) {
           try {
             const reqHeaders =
-              methodLower === "get" ? omitContentType({ ...fetchOptions.headers }) : fetchOptions.headers;
+              methodLower === "get" ? omitContentType({ ...fetchOptions.headers }) : { ...fetchOptions.headers };
             if (bytesReceived > 0) reqHeaders["Range"] = `bytes=${bytesReceived}-`;
-            const streamResponse = await fetch(url, { ...fetchOptions, headers: reqHeaders });
+            const streamResponse = await fetch(url, {
+              ...fetchOptions,
+              headers: reqHeaders,
+            });
             if (streamResponse.status >= 400) {
-              streamError = makeError(streamResponse.statusText);
+              streamError = makeError(streamResponse.statusText || DEFAULT_ERROR);
               break;
             }
             if (streamResponse.status === 204) {
@@ -463,12 +550,12 @@ const apiRequest = async <TData>(
       const response = await fetch(url, fetchOptions);
 
       if (response.status >= 400) {
-        callerResponse(cacheName, null, hookId, response.status, makeError(response.statusText));
+        callerResponse(cacheName, null, hookId, response.status, makeError(response.statusText || DEFAULT_ERROR));
         return;
       }
 
       if (response.status === 204) {
-        set(normalizeKey(cacheName), null);
+        set(cacheName, null); // set() normalizes internally - avoid double-normalizing here
         callerResponse(cacheName, null, hookId, 204);
         return;
       }
@@ -505,7 +592,10 @@ const apiRequest = async <TData>(
     }
   })();
 
-  inFlightByCacheName.set(cacheName, promise);
+  if (!skipInFlightDedupe) {
+    inFlightByCacheName.set(cacheName, promise);
+  }
+
   await promise;
 };
 
@@ -570,6 +660,12 @@ const onRequest = <TData>(dataRequest: DataRequest<TData>): void => {
   }
 };
 
+/**
+ * Aborts the in-flight request registered under requestId, if any. Note: if that request was
+ * joined/deduped by another caller via inFlightByCacheName (same cacheName, request already in
+ * flight), this only aborts the original request's controller - the joined caller was never
+ * registered with its own controller/requestId, so it has nothing to cancel independently.
+ */
 const onCancel = (requestId: string): void => {
   const controller = inFlightControllers.get(requestId);
   if (controller) {
