@@ -302,8 +302,6 @@ const buildUrlEncodedBody = (payload: Record<string, unknown>): BodyInit => {
       if (typeof value === "object") {
         throw new Error(`Cannot url-encode non-primitive value for key "${key}"`);
       }
-      //params.append(key, String(value as string | number | boolean | bigint));
-      // params.append(key, String(value));
       params.append(key, (value as string | number | boolean | bigint).toString());
     }
     i++;
@@ -401,6 +399,13 @@ const prepareRequestBody = (
 const inFlightControllers: AbortControllers = new Map();
 const inFlightByCacheName = new Map<string, Promise<void>>();
 
+/**
+ * @note Deduped joiners cannot cancel independently: when a second caller joins an in-flight
+ * request via the `inFlightByCacheName` map (same cacheName, request already running), only the
+ * original request's requestId is registered in `inFlightControllers`. The joining caller has no
+ * AbortController of its own, so posting `{ type: "cancel" }` with the joiner's requestId is a
+ * no-op — the original request continues for all other awaiting callers.
+ */
 const apiRequest = async <TData>(
   cacheName: string,
   payload: TData | FormData | null,
@@ -427,10 +432,6 @@ const apiRequest = async <TData>(
   if (!skipInFlightDedupe) {
     const existing = inFlightByCacheName.get(cacheName);
     if (existing) {
-      // Joining an in-flight request by cacheName: this caller does not get its own
-      // AbortController registered (only the original request's requestId is tracked in
-      // inFlightControllers below), so calling cancel with this caller's requestId is a no-op -
-      // the original in-flight request keeps running for whoever else is awaiting it too.
       const cached = get(cacheName);
       if (cached !== undefined) callerResponse(cacheName, cached, hookId);
       await existing;
@@ -484,6 +485,7 @@ const apiRequest = async <TData>(
         let bytesReceived = 0;
         let streamError: WorkerErrorPayload = NO_ERROR;
         let attempt = 0;
+        let isPermanentError = false;
         while (attempt <= maxRetries) {
           try {
             const reqHeaders =
@@ -495,13 +497,18 @@ const apiRequest = async <TData>(
             });
             if (streamResponse.status >= 400) {
               streamError = makeError(streamResponse.statusText || DEFAULT_ERROR);
+              isPermanentError = true;
               break;
             }
             if (streamResponse.status === 204) {
               callerResponseStreamEnd(cacheName, hookId);
               return;
             }
-            if (streamResponse.status === 416) break;
+            if (streamResponse.status === 416) {
+              streamError = makeError("Range Not Satisfiable");
+              isPermanentError = true;
+              break;
+            }
             const contentType = streamResponse.headers.get("content-type") ?? undefined;
             const meta: BinaryResponseMeta = {
               contentDisposition: streamResponse.headers.get("content-disposition") ?? null,
@@ -537,10 +544,15 @@ const apiRequest = async <TData>(
             }
             break;
           } catch (err) {
-            streamError =
-              (err as Error).name === "AbortError" ? makeError("Request aborted") : makeError((err as Error).message);
+            if ((err as Error).name === "AbortError") {
+              streamError = makeError("Request aborted");
+              isPermanentError = true;
+              break;
+            }
+            streamError = makeError((err as Error).message);
             if (attempt === maxRetries) break;
           }
+          if (isPermanentError) break;
           attempt++;
         }
         callerResponseStreamEnd(cacheName, hookId, streamError);
@@ -661,10 +673,11 @@ const onRequest = <TData>(dataRequest: DataRequest<TData>): void => {
 };
 
 /**
- * Aborts the in-flight request registered under requestId, if any. Note: if that request was
- * joined/deduped by another caller via inFlightByCacheName (same cacheName, request already in
- * flight), this only aborts the original request's controller - the joined caller was never
- * registered with its own controller/requestId, so it has nothing to cancel independently.
+ * Aborts the in-flight request registered under requestId, if any.
+ * @note Deduped joiners cannot cancel independently: if the request for this cacheName was already
+ * in-flight when a second caller joined, that joiner was never assigned its own AbortController or
+ * requestId entry in `inFlightControllers`. Cancelling with the joiner's requestId is therefore a
+ * no-op — the original request keeps running for all other awaiting callers.
  */
 const onCancel = (requestId: string): void => {
   const controller = inFlightControllers.get(requestId);

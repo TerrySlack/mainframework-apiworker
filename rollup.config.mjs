@@ -2,6 +2,7 @@ import resolve from "@rollup/plugin-node-resolve";
 import esbuild from "rollup-plugin-esbuild";
 import replace from "@rollup/plugin-replace";
 import { dts } from "rollup-plugin-dts";
+import babel from "@rollup/plugin-babel";
 
 const jsConfig = {
   input: {
@@ -24,6 +25,15 @@ const jsConfig = {
       values: {
         '"use client";': "",
       },
+    }),
+    babel({
+      include: ["**/hooks/useApiWorker.ts"],
+      plugins: [
+        "@babel/plugin-syntax-typescript",
+        ["babel-plugin-react-compiler", {}],
+      ],
+      extensions: [".ts", ".tsx"],
+      babelHelpers: "bundled",
     }),
     esbuild({
       include: /\.[jt]sx?$/,

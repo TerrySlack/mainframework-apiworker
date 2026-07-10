@@ -29,7 +29,7 @@ The library supports three response types to handle different use cases:
 
 - **`responseType: "binary"`**: Full binary response is buffered in the worker and sent as an `ArrayBuffer` in a single message. Perfect for complete binary files like images, PDFs, or downloadable documents.
 
-- **`responseType: "stream"`**: Responses are streamed incrementally to the client. The worker sends chunks as they arrive (`start` → `chunk` → `chunk` → ... → `end`), enabling playback of audio/video streams to begin before the full file downloads. The React hook returns `streamChunks` (batches of `ArrayBuffer[]`) as they arrive and a final `Blob` in `data` when complete. Throttling (default: every 5 chunks or 50ms) minimizes re-renders. For vanilla JavaScript, you handle stream events manually for maximum control.
+- **`responseType: "stream"`**: Responses are streamed incrementally to the client. The worker sends chunks as they arrive (`start` → `chunk` → `chunk` → ... → `end`), enabling playback of audio/video streams to begin before the full file downloads. The React hook returns `streamChunks` (batches of `ArrayBuffer[]`) as they arrive and a final `Blob` in `data` when complete. Throttling (default: every 5 chunks, configurable via `streamChunkBatchSize`) minimizes re-renders. For vanilla JavaScript, you handle stream events manually for maximum control.
 
 Binary and stream responses are not stored in the worker cache; only json/text responses are cached.
 

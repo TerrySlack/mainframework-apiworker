@@ -1,5 +1,5 @@
 // useApiWorker.ts
-import { useRef, useState, useCallback } from "react";
+import { useRef, useState, useEffect } from "react";
 import { createApiWorker } from "../utils/createApiWorker";
 import { uniqueId } from "../utils/uniqueId";
 import type {
@@ -24,8 +24,6 @@ const toNumber = (val: unknown, fallback: number): number =>
 
 const toStreamChunks = (val: unknown): ArrayBuffer[] | undefined =>
   val === undefined || val === null ? undefined : Array.isArray(val) ? (val as ArrayBuffer[]) : undefined;
-
-import { useCustomCallback } from "./useCustomCallback";
 
 // ============================================================================
 // MODULE-LEVEL WORKER & QUEUE
@@ -66,7 +64,6 @@ const runStaleEntryCleanup = (): void => {
         entry.data = null;
         entry.meta = null;
         entry.error = null;
-        entry.setUpdateTrigger = null;
         entry.requestId = null;
         delete entry.streamChunks;
         delete streamThrottleState[key];
@@ -91,7 +88,7 @@ const flushStreamBatch = (key: string, entry: QueueEntry<unknown>): void => {
   if (!state || state.pendingChunks.length === 0) return;
   entry.streamChunks = state.pendingChunks.slice();
   state.pendingChunks.length = 0;
-  entry.setUpdateTrigger?.(updater);
+  entry.setUpdateTriggers.forEach((fn) => fn(updater));
 };
 
 const findEntry = (cacheName: string | undefined, hookId: string | undefined) =>
@@ -103,7 +100,7 @@ const findEntry = (cacheName: string | undefined, hookId: string | undefined) =>
 
 const finalizeEntry = (entry: QueueEntry<unknown>): void => {
   entry.requestId = null;
-  entry.setUpdateTrigger?.(updater);
+  entry.setUpdateTriggers.forEach((fn) => fn(updater));
 };
 
 const getApiWorker = (): Worker => {
@@ -140,7 +137,7 @@ const ensureWorkerInitialized = (): Worker => {
           streamThrottleState[key] = { pendingChunks: [] };
           entry.streamChunks = [];
           entry.meta = msg.meta ?? null;
-          entry.setUpdateTrigger?.(updater);
+          entry.setUpdateTriggers.forEach((fn) => fn(updater));
           return;
         }
         case "resume":
@@ -230,7 +227,7 @@ export const useApiWorker = <T>(config: UseApiWorkerConfig): UseApiWorkerReturn<
       data: null,
       loading: false,
       error: null,
-      setUpdateTrigger: () => {},
+      setUpdateTriggers: new Set(),
       requestId: null,
       meta: null,
       lastActivityAt: null,
@@ -241,25 +238,31 @@ export const useApiWorker = <T>(config: UseApiWorkerConfig): UseApiWorkerReturn<
     storeEntry.lastActivityAt = Date.now();
   }
   const entry = storeEntry;
-  entry.setUpdateTrigger = setUpdateTrigger;
 
   const hookId = hookIdRef.current;
 
-  const deleteCache = useCallback(() => {
+  useEffect(() => {
+    responseQueue[queueKey]?.setUpdateTriggers.add(setUpdateTrigger);
+    return () => {
+      responseQueue[queueKey]?.setUpdateTriggers.delete(setUpdateTrigger);
+    };
+  }, [queueKey]);
+
+  const deleteCache = () => {
     if (cacheName) {
       worker.postMessage({
         dataRequest: { type: "delete", cacheName, hookId: hookIdRef.current },
       });
     }
-  }, [cacheName, worker]);
+  };
 
-  const doRequest = useCallback(() => {
+  const doRequest = () => {
     const entry = responseQueue[queueKey];
     if (!entry || entry.loading) return;
     entry.loading = true;
     entry.error = null;
     entry.lastActivityAt = Date.now();
-    entry.setUpdateTrigger?.(updater);
+    entry.setUpdateTriggers.forEach((fn) => fn(updater));
     if (requestConfig) {
       const requestId = uniqueId();
       entry.requestId = requestId;
@@ -276,12 +279,21 @@ export const useApiWorker = <T>(config: UseApiWorkerConfig): UseApiWorkerReturn<
       worker.postMessage({ dataRequest: { type: "get", cacheName, hookId } as DataRequest<unknown> });
     }
     hasExecutedRef.current = true;
-  }, [queueKey, cacheName, hookId, requestConfig, configData, worker]);
+  };
 
-  const makeRequest = useCustomCallback(() => {
+  const makeRequest = () => {
     if (!enabled || (runMode === "once" && hasExecutedRef.current)) return;
     doRequest();
-  }, [enabled, runMode, doRequest]);
+  };
+
+  useEffect(() => {
+    return () => {
+      const requestId = responseQueue[queueKey]?.requestId;
+      if (requestId) {
+        worker.postMessage({ dataRequest: { type: "cancel", cacheName, requestId } });
+      }
+    };
+  }, [queueKey, cacheName, worker]);
 
   const hasAlreadyRunOnce = runMode === "once" && hasExecutedRef.current;
   const shouldRun = (runMode === "auto" || runMode === "once") && enabled && (requestConfig || cacheName);
