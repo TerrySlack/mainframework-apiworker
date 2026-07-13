@@ -62,9 +62,14 @@ export type BinaryParseResult = {
   contentType: string;
 } & Pick<BinaryResponseMeta, "contentDisposition">;
 
+export type WorkerResponseType = "result" | "delete" | "stream";
+
+export type WorkerErrorCode = "aborted" | "timeout" | "http" | "network" | "validation";
+
 /** Worker always sends this shape; no error = { message: "" }. */
 export interface WorkerErrorPayload {
   message: string;
+  code?: WorkerErrorCode;
 }
 
 export interface QueueEntry<T> {
@@ -74,6 +79,7 @@ export interface QueueEntry<T> {
   data: T | null;
   meta: BinaryResponseMeta | null;
   error: string | null;
+  errorCode: WorkerErrorCode | null;
   setUpdateTriggers: Set<(value: number | ((prev: number) => number)) => void>;
   requestId: string | null;
   lastActivityAt: number | null;
@@ -88,6 +94,7 @@ export interface UseApiWorkerReturn<T> {
   meta: BinaryResponseMeta | null;
   loading: boolean;
   error: string | null;
+  errorCode: WorkerErrorCode | null;
   refetch: () => void;
   deleteCache: () => void;
   /** For responseType "stream": batch of chunks since last flush. Undefined for non-stream. */
@@ -103,10 +110,13 @@ export type WorkerResponseMessage = WorkerMessagePayload;
  * Payload shape for worker postMessage. Use for client onmessage:
  * MessageEvent<WorkerMessagePayload>. The worker always sends error (same shape: { message: string }).
  * No error = { message: "" }. With error = { message: "..." }.
+ * `type` disambiguates result, delete-ack, and stream messages. `requestId` echoes the originating request.
  * When stream is present, client receives start → chunk(s) → end; cancel via existing requestId/cancel.
  */
 export type WorkerMessagePayload =
   | {
+      type: "result" | "delete";
+      requestId?: string;
       cacheName?: string;
       data?: unknown;
       meta?: BinaryResponseMeta;
@@ -115,6 +125,8 @@ export type WorkerMessagePayload =
       httpStatus?: number;
     }
   | {
+      type: "stream";
+      requestId?: string;
       cacheName: string;
       stream: "start";
       meta: BinaryResponseMeta | null;
@@ -123,6 +135,8 @@ export type WorkerMessagePayload =
       error: WorkerErrorPayload;
     }
   | {
+      type: "stream";
+      requestId?: string;
       cacheName: string;
       stream: "resume";
       meta: BinaryResponseMeta | null;
@@ -130,7 +144,22 @@ export type WorkerMessagePayload =
       httpStatus?: number;
       error: WorkerErrorPayload;
     }
-  | { cacheName: string; stream: "chunk"; data: ArrayBuffer; hookId?: string; error: WorkerErrorPayload }
-  | { cacheName: string; stream: "end"; hookId?: string; error: WorkerErrorPayload };
+  | {
+      type: "stream";
+      requestId?: string;
+      cacheName: string;
+      stream: "chunk";
+      data: ArrayBuffer;
+      hookId?: string;
+      error: WorkerErrorPayload;
+    }
+  | {
+      type: "stream";
+      requestId?: string;
+      cacheName: string;
+      stream: "end";
+      hookId?: string;
+      error: WorkerErrorPayload;
+    };
 
 export type WorkerMessageData = { dataRequest?: DataRequest<unknown> };

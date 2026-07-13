@@ -53,20 +53,21 @@ const runStaleEntryCleanup = (): void => {
       const key = keys[i] as string;
       const entry = responseQueue[key];
       const streamInProgress = streamThrottleState[key] != null || streamAccumulators[key] != null;
-      if (
-        entry &&
-        !streamInProgress &&
-        entry.data != null &&
-        entry.lastActivityAt != null &&
-        now - entry.lastActivityAt >= STALE_ENTRY_MS
-      ) {
-        entry.loading = null;
-        entry.data = null;
-        entry.meta = null;
-        entry.error = null;
-        entry.requestId = null;
-        delete entry.streamChunks;
-        delete streamThrottleState[key];
+      if (entry && !streamInProgress && entry.lastActivityAt != null && now - entry.lastActivityAt >= STALE_ENTRY_MS) {
+        if (entry.setUpdateTriggers.size === 0) {
+          delete responseQueue[key];
+          delete streamThrottleState[key];
+          delete streamAccumulators[key];
+        } else if (entry.data != null) {
+          entry.loading = null;
+          entry.data = null;
+          entry.meta = null;
+          entry.error = null;
+          entry.errorCode = null;
+          entry.requestId = null;
+          delete entry.streamChunks;
+          delete streamThrottleState[key];
+        }
       }
       i++;
     }
@@ -130,6 +131,7 @@ const ensureWorkerInitialized = (): Worker => {
     if ("stream" in msg && msg.stream) {
       const entry = findEntry(cacheName, hookId);
       if (!entry) return;
+      if (msg.requestId != null && msg.requestId !== "" && entry.requestId !== msg.requestId) return;
       const batchSize = toNumber(entry.streamChunkBatchSize, DEFAULT_CHUNK_BATCH);
       switch (msg.stream) {
         case "start": {
@@ -167,10 +169,12 @@ const ensureWorkerInitialized = (): Worker => {
           const errMsg = error?.message ?? "";
           if (errMsg !== "") {
             entry.error = errMsg;
+            entry.errorCode = error?.code ?? null;
           } else if (acc) {
             entry.data = new Blob(acc.chunks, acc.meta?.contentType ? { type: acc.meta.contentType } : undefined);
             entry.meta = acc.meta ?? null;
             entry.error = null;
+            entry.errorCode = null;
             entry.lastActivityAt = Date.now();
           }
           entry.loading = false;
@@ -182,16 +186,29 @@ const ensureWorkerInitialized = (): Worker => {
 
     const entry = findEntry(cacheName, hookId);
     if (!entry) return;
+    if (msg.requestId != null && msg.requestId !== "" && entry.requestId !== msg.requestId) return;
+
+    if (msg.type === "delete") {
+      entry.data = null;
+      entry.meta = null;
+      entry.error = null;
+      entry.errorCode = null;
+      entry.loading = false;
+      finalizeEntry(entry);
+      return;
+    }
 
     const message = error?.message ?? "";
     if (message !== "") {
       entry.error = message;
+      entry.errorCode = error?.code ?? null;
       entry.loading = false;
     } else {
       entry.data = msg.data ?? null;
       entry.meta = msg.meta ?? null;
       entry.lastActivityAt = Date.now();
       entry.error = null;
+      entry.errorCode = null;
       entry.loading = false;
     }
     finalizeEntry(entry);
@@ -206,7 +223,8 @@ const ensureWorkerInitialized = (): Worker => {
 
 export type { RequestConfig, UseApiWorkerConfig, UseApiWorkerReturn } from "../types/types";
 
-export const useApiWorker = <T>(config: UseApiWorkerConfig): UseApiWorkerReturn<T> => {
+export const useApiWorker = <T>(config: UseApiWorkerConfig): UseApiWorkerReturn<T> | null => {
+  if (!window) return null;
   const { cacheName, request: requestConfig, data: configData, runMode = "auto", enabled = true } = config;
 
   const worker = ensureWorkerInitialized();
@@ -227,6 +245,7 @@ export const useApiWorker = <T>(config: UseApiWorkerConfig): UseApiWorkerReturn<
       data: null,
       loading: false,
       error: null,
+      errorCode: null,
       setUpdateTriggers: new Set(),
       requestId: null,
       meta: null,
@@ -244,9 +263,17 @@ export const useApiWorker = <T>(config: UseApiWorkerConfig): UseApiWorkerReturn<
   useEffect(() => {
     responseQueue[queueKey]?.setUpdateTriggers.add(setUpdateTrigger);
     return () => {
-      responseQueue[queueKey]?.setUpdateTriggers.delete(setUpdateTrigger);
+      const storeEntry = responseQueue[queueKey];
+      if (!storeEntry) return;
+      storeEntry.setUpdateTriggers.delete(setUpdateTrigger);
+      if (storeEntry.setUpdateTriggers.size === 0) {
+        const requestId = storeEntry.requestId;
+        if (requestId) {
+          worker.postMessage({ dataRequest: { type: "cancel", cacheName, requestId } });
+        }
+      }
     };
-  }, [queueKey]);
+  }, [queueKey, cacheName, worker]);
 
   const deleteCache = () => {
     if (cacheName) {
@@ -261,12 +288,13 @@ export const useApiWorker = <T>(config: UseApiWorkerConfig): UseApiWorkerReturn<
     if (!entry || entry.loading) return;
     entry.loading = true;
     entry.error = null;
+    entry.errorCode = null;
     entry.lastActivityAt = Date.now();
     entry.setUpdateTriggers.forEach((fn) => fn(updater));
     if (requestConfig) {
       const requestId = uniqueId();
       entry.requestId = requestId;
-      const isStream = requestConfig.responseType?.toLowerCase() === "stream";
+      const isStream = requestConfig.responseType?.toLocaleLowerCase() === "stream";
       if (isStream) {
         entry.streamChunkBatchSize = toNumber(requestConfig.streamChunkBatchSize, DEFAULT_CHUNK_BATCH);
       }
@@ -286,15 +314,6 @@ export const useApiWorker = <T>(config: UseApiWorkerConfig): UseApiWorkerReturn<
     doRequest();
   };
 
-  useEffect(() => {
-    return () => {
-      const requestId = responseQueue[queueKey]?.requestId;
-      if (requestId) {
-        worker.postMessage({ dataRequest: { type: "cancel", cacheName, requestId } });
-      }
-    };
-  }, [queueKey, cacheName, worker]);
-
   const hasAlreadyRunOnce = runMode === "once" && hasExecutedRef.current;
   const shouldRun = (runMode === "auto" || runMode === "once") && enabled && (requestConfig || cacheName);
   if (shouldRun && !hasAlreadyRunOnce && !entry.loading) {
@@ -305,6 +324,7 @@ export const useApiWorker = <T>(config: UseApiWorkerConfig): UseApiWorkerReturn<
     meta: entry.meta ?? null,
     loading: entry.loading ?? false,
     error: entry.error ?? null,
+    errorCode: entry.errorCode ?? null,
     refetch: makeRequest,
     deleteCache,
     streamChunks: toStreamChunks(entry.streamChunks),

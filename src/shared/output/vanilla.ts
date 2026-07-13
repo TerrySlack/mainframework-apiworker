@@ -5,6 +5,8 @@ export type {
   BinaryResponseMeta,
   WorkerMessagePayload,
   WorkerErrorPayload,
+  WorkerErrorCode,
+  WorkerResponseType,
   WorkerResponseMessage,
   ResponseType,
   RunMode,

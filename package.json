@@ -24,14 +24,14 @@
   "bugs": {
     "url": "https://github.com/TerrySlack/mainframework-apiworker/issues"
   },
-  "homepage": "https://github.com/TerrySlack/mainframework-apiworkere",
+  "homepage": "https://github.com/TerrySlack/mainframework-apiworker",
   "scripts": {
     "husky": "husky",
     "prepare": "husky",
     "clean": "rimraf dist tsconfig.tsbuildinfo",
     "lint-staged": "lint-staged",
     "prebuild": "yarn husky && yarn clean",
-    "build": "yarn prebuild && rollup -c",
+    "build": "rollup -c",
     "tscheck": "tsc"
   },
   "lint-staged": {
@@ -67,7 +67,6 @@
     "@babel/core": "8",
     "@babel/plugin-syntax-typescript": "8",
     "@eslint/js": "^10.0.1",
-    "@mainframework/is-deep-equal": "^1.1.0",
     "@rollup/plugin-babel": "^7.1.0",
     "@rollup/plugin-node-resolve": "^16.0.3",
     "@rollup/plugin-replace": "^6.0.3",
@@ -78,7 +77,7 @@
     "@typescript-eslint/parser": "^8.63.0",
     "babel-plugin-react-compiler": "^1.0.0",
     "esbuild": "^0.28.1",
-    "eslint": "10.6.0",
+    "eslint": "10.7.0",
     "eslint-plugin-react": "^7.37.5",
     "eslint-plugin-react-hooks": "^7.1.1",
     "globals": "^17.7.0",

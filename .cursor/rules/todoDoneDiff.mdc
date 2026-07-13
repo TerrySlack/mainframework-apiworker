@@ -1,0 +1,25 @@
+---
+description: Before marking a todo done, git diff must only contain that todo's work
+alwaysApply: true
+---
+
+# Todo completion: scoped diff only
+
+Before setting any todo status to `completed`:
+
+1. **Define scope** from the todo's stated instructions only. Anything added beyond that is scope creep.
+
+2. **Inspect changes**:
+   - `git status`
+   - `git diff` (unstaged)
+   - `git diff --cached` (staged)
+
+3. **Revert scope creep** — any change not required by the current todo:
+   - Tracked files: `git restore <path>` or `git restore --staged <path>` as needed
+   - Untracked files: delete or move out of the working tree if they are not part of this todo
+
+4. **Re-check** until `git diff`, `git diff --cached`, and `git status` show only work for this todo.
+
+5. **Then** mark the todo `completed`.
+
+Do not mark a todo done while unrelated agent changes remain in the working tree.

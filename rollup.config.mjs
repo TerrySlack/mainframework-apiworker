@@ -26,6 +26,7 @@ const jsConfig = {
         '"use client";': "",
       },
     }),
+    resolve(),
     babel({
       include: ["**/hooks/useApiWorker.ts"],
       plugins: [
@@ -39,7 +40,6 @@ const jsConfig = {
       include: /\.[jt]sx?$/,
       tsconfig: "tsconfig.rollup.json",
     }),
-    resolve(),
   ],
   external: ["react"],
 };
@@ -53,6 +53,7 @@ const dtsConfig = {
     dir: "dist",
     entryFileNames: "shared/output/[name].d.ts",
   },
+  external: ["react"],
   plugins: [
     dts({
       tsconfig: "tsconfig.rollup.json",
