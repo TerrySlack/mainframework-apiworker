@@ -1,11 +1,11 @@
 /// <reference lib="webworker" />
 
 import type {
-  AbortControllers,
   BinaryParseResult,
   BinaryResponseMeta,
   DataRequest,
   WorkerApiRequest,
+  WorkerErrorCode,
   WorkerErrorPayload,
   WorkerMessageData,
 } from "../../types/types";
@@ -23,17 +23,22 @@ const callerResponse = (
   hookId?: string | null,
   httpStatus?: number,
   error: WorkerErrorPayload = NO_ERROR,
+  type: "result" | "delete" = "result",
+  requestId?: string | null,
 ): void => {
   self.postMessage({
+    type,
+    ...(requestId != null && requestId !== "" && { requestId }),
     cacheName,
-    data: error.message !== "" ? null : (data ?? null),
+    data: type === "delete" ? null : error.message !== "" ? null : (data ?? null),
     hookId,
     httpStatus,
     error,
   });
 };
 
-const makeError = (message: string): WorkerErrorPayload => ({ message });
+const makeError = (message: string, code?: WorkerErrorCode): WorkerErrorPayload =>
+  code !== undefined ? { message, code } : { message };
 
 /**
  * Binary response - transferred via postMessage, not stored in cache.
@@ -47,9 +52,19 @@ const callerResponseBinary = (
   hookId?: string | null,
   httpStatus?: number,
   error: WorkerErrorPayload = NO_ERROR,
+  requestId?: string | null,
 ): void => {
   const buffer = data.byteLength ? data : EMPTY_BUFFER;
-  const payload = { cacheName, data: buffer, meta, hookId, httpStatus, error };
+  const payload = {
+    type: "result" as const,
+    ...(requestId != null && requestId !== "" && { requestId }),
+    cacheName,
+    data: buffer,
+    meta,
+    hookId,
+    httpStatus,
+    error,
+  };
   self.postMessage(payload, buffer.byteLength > 0 ? [buffer] : []);
 };
 
@@ -59,8 +74,11 @@ const callerResponseStreamStart = (
   hookId?: string | null,
   httpStatus?: number,
   error: WorkerErrorPayload = NO_ERROR,
+  requestId?: string | null,
 ): void => {
   self.postMessage({
+    type: "stream" as const,
+    ...(requestId != null && requestId !== "" && { requestId }),
     cacheName,
     stream: "start",
     meta,
@@ -76,8 +94,11 @@ const callerResponseStreamResume = (
   hookId?: string | null,
   httpStatus?: number,
   error: WorkerErrorPayload = NO_ERROR,
+  requestId?: string | null,
 ): void => {
   self.postMessage({
+    type: "stream" as const,
+    ...(requestId != null && requestId !== "" && { requestId }),
     cacheName,
     stream: "resume",
     meta,
@@ -92,9 +113,18 @@ const callerResponseStreamChunk = (
   data: ArrayBuffer,
   hookId?: string | null,
   error: WorkerErrorPayload = NO_ERROR,
+  requestId?: string | null,
 ): void => {
   const buffer = data.byteLength ? data : EMPTY_BUFFER;
-  const payload = { cacheName, stream: "chunk", data: buffer, hookId, error };
+  const payload = {
+    type: "stream" as const,
+    ...(requestId != null && requestId !== "" && { requestId }),
+    cacheName,
+    stream: "chunk" as const,
+    data: buffer,
+    hookId,
+    error,
+  };
   self.postMessage(payload, buffer.byteLength > 0 ? [buffer] : []);
 };
 
@@ -102,8 +132,16 @@ const callerResponseStreamEnd = (
   cacheName: string,
   hookId?: string | null,
   error: WorkerErrorPayload = NO_ERROR,
+  requestId?: string | null,
 ): void => {
-  self.postMessage({ cacheName, stream: "end", hookId, error });
+  self.postMessage({
+    type: "stream" as const,
+    ...(requestId != null && requestId !== "" && { requestId }),
+    cacheName,
+    stream: "end",
+    hookId,
+    error,
+  });
 };
 
 const transferableBuffer = (view: Uint8Array): ArrayBuffer =>
@@ -112,13 +150,28 @@ const transferableBuffer = (view: Uint8Array): ArrayBuffer =>
     : view.slice(0).buffer;
 
 const store = Object.create(null) as Record<string, unknown>;
+const storeActivity = new Map<string, number>();
+const STALE_ENTRY_MS = 5000;
+const CLEANUP_INTERVAL_MS = 30000;
+
 const normalizeKey = (key: string) => key.toLocaleLowerCase();
-const get = <TData>(key: string): TData | undefined => store[normalizeKey(key)] as TData | undefined;
+const touchActivity = (key: string): void => {
+  storeActivity.set(normalizeKey(key), Date.now());
+};
+const get = <TData>(key: string): TData | undefined => {
+  const nk = normalizeKey(key);
+  touchActivity(nk);
+  return store[nk] as TData | undefined;
+};
 const set = <TData>(key: string, value: TData): void => {
-  store[normalizeKey(key)] = value;
+  const nk = normalizeKey(key);
+  store[nk] = value;
+  touchActivity(nk);
 };
 const remove = (key: string): void => {
-  delete store[normalizeKey(key)];
+  const nk = normalizeKey(key);
+  delete store[nk];
+  storeActivity.delete(nk);
 };
 
 const isNonEmptyString = (v: unknown): v is string => typeof v === "string" && v.trim() !== "";
@@ -137,13 +190,28 @@ const isBinaryResponse = (r: unknown): r is BinaryParseResult =>
   BINARY_MARKER in r &&
   (r as unknown as BinaryParseResult).data instanceof ArrayBuffer;
 
-const commit = <TData>(cacheName: string, data: TData, hookId?: string | null, httpStatus?: number): void => {
+const commit = <TData>(
+  cacheName: string,
+  data: TData,
+  hookId?: string | null,
+  httpStatus?: number,
+  requestId?: string | null,
+): void => {
   if (!cacheName) {
-    callerResponse("", null, hookId, undefined, makeError("Invalid commit: cacheName is required"));
+    callerResponse(
+      "",
+      null,
+      hookId,
+      undefined,
+      makeError("Invalid commit: cacheName is required", "validation"),
+      "result",
+      requestId,
+    );
     return;
   }
   set(cacheName, data); // set() normalizes internally - avoid double-normalizing here
-  callerResponse(cacheName, data, hookId, httpStatus);
+  touchActivity(cacheName);
+  callerResponse(cacheName, data, hookId, httpStatus, NO_ERROR, "result", requestId);
 };
 
 /**
@@ -209,14 +277,15 @@ const appendToFormData = (
   }
 
   if (value !== null && value !== undefined && typeof value === "object") {
-    const set = visited ?? new WeakSet<object>();
-    if (set.has(value)) return false;
-    set.add(value);
+    const visitedSet = visited ?? new WeakSet<object>();
+    if (visitedSet.has(value)) return false;
+    visitedSet.add(value);
     if (Array.isArray(value)) {
       let hasFile = false;
       let i = 0;
       while (i < value.length) {
-        hasFile = appendToFormData(formData, key ? `${key}.${i}` : String(i), value[i], fileFieldName, set) || hasFile;
+        hasFile =
+          appendToFormData(formData, key ? `${key}.${i}` : String(i), value[i], fileFieldName, visitedSet) || hasFile;
         i++;
       }
       return hasFile;
@@ -232,7 +301,7 @@ const appendToFormData = (
           key ? `${key}.${k}` : k,
           (value as Record<string, unknown>)[k],
           fileFieldName,
-          set,
+          visitedSet,
         ) || hasFile;
 
       ki++;
@@ -302,8 +371,6 @@ const buildUrlEncodedBody = (payload: Record<string, unknown>): BodyInit => {
       if (typeof value === "object") {
         throw new Error(`Cannot url-encode non-primitive value for key "${key}"`);
       }
-      //params.append(key, String(value as string | number | boolean | bigint));
-      // params.append(key, String(value));
       params.append(key, (value as string | number | boolean | bigint).toString());
     }
     i++;
@@ -398,8 +465,13 @@ const prepareRequestBody = (
   }
 };
 
-const inFlightControllers: AbortControllers = new Map();
-const inFlightByCacheName = new Map<string, Promise<void>>();
+type InFlightEntry = {
+  promise: Promise<void>;
+  controller: AbortController;
+  requestIds: Set<string>;
+};
+const inFlightByCacheName = new Map<string, InFlightEntry>();
+const requestIdToCacheName = new Map<string, string>();
 
 const apiRequest = async <TData>(
   cacheName: string,
@@ -427,27 +499,34 @@ const apiRequest = async <TData>(
   if (!skipInFlightDedupe) {
     const existing = inFlightByCacheName.get(cacheName);
     if (existing) {
-      // Joining an in-flight request by cacheName: this caller does not get its own
-      // AbortController registered (only the original request's requestId is tracked in
-      // inFlightControllers below), so calling cancel with this caller's requestId is a no-op -
-      // the original in-flight request keeps running for whoever else is awaiting it too.
+      if (requestId) {
+        existing.requestIds.add(requestId);
+        requestIdToCacheName.set(requestId, cacheName);
+      }
       const cached = get(cacheName);
-      if (cached !== undefined) callerResponse(cacheName, cached, hookId);
-      await existing;
+      if (cached !== undefined) callerResponse(cacheName, cached, hookId, undefined, NO_ERROR, "result", requestId);
+      await existing.promise;
       const fresh = get(cacheName);
-      if (fresh !== undefined) callerResponse(cacheName, fresh, hookId);
+      if (fresh !== undefined) callerResponse(cacheName, fresh, hookId, undefined, NO_ERROR, "result", requestId);
       return;
     }
   }
 
   const controller = new AbortController();
+  const requestIds = new Set<string>();
+  const inflightKey = skipInFlightDedupe && requestId ? requestId : cacheName;
   if (requestId) {
-    inFlightControllers.set(requestId, controller);
+    requestIds.add(requestId);
+    requestIdToCacheName.set(requestId, inflightKey);
   }
 
   let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  let abortedByTimeout = false;
   if (timeoutMs != null && timeoutMs > 0) {
-    timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    timeoutId = setTimeout(() => {
+      abortedByTimeout = true;
+      controller.abort();
+    }, timeoutMs);
   }
 
   const promise = (async (): Promise<void> => {
@@ -484,6 +563,7 @@ const apiRequest = async <TData>(
         let bytesReceived = 0;
         let streamError: WorkerErrorPayload = NO_ERROR;
         let attempt = 0;
+        let isPermanentError = false;
         while (attempt <= maxRetries) {
           try {
             const reqHeaders =
@@ -494,24 +574,30 @@ const apiRequest = async <TData>(
               headers: reqHeaders,
             });
             if (streamResponse.status >= 400) {
-              streamError = makeError(streamResponse.statusText || DEFAULT_ERROR);
+              streamError = makeError(streamResponse.statusText || DEFAULT_ERROR, "http");
+              isPermanentError = true;
               break;
             }
             if (streamResponse.status === 204) {
-              callerResponseStreamEnd(cacheName, hookId);
+              callerResponseStreamEnd(cacheName, hookId, NO_ERROR, requestId);
               return;
             }
-            if (streamResponse.status === 416) break;
+            if (streamResponse.status === 416) {
+              streamError = makeError("Range Not Satisfiable", "http");
+              isPermanentError = true;
+              break;
+            }
             const contentType = streamResponse.headers.get("content-type") ?? undefined;
             const meta: BinaryResponseMeta = {
               contentDisposition: streamResponse.headers.get("content-disposition") ?? null,
               ...(contentType !== undefined && { contentType }),
             };
-            if (bytesReceived === 0) callerResponseStreamStart(cacheName, meta, hookId, streamResponse.status);
-            else callerResponseStreamResume(cacheName, meta, hookId, streamResponse.status);
+            if (bytesReceived === 0)
+              callerResponseStreamStart(cacheName, meta, hookId, streamResponse.status, NO_ERROR, requestId);
+            else callerResponseStreamResume(cacheName, meta, hookId, streamResponse.status, NO_ERROR, requestId);
             const body = streamResponse.body;
             if (!body) {
-              callerResponseStreamEnd(cacheName, hookId);
+              callerResponseStreamEnd(cacheName, hookId, NO_ERROR, requestId);
               return;
             }
             const reader = body.getReader();
@@ -528,35 +614,48 @@ const apiRequest = async <TData>(
                 const offset = skipRemaining;
                 skipRemaining = 0;
                 const tail = value.subarray(offset);
-                callerResponseStreamChunk(cacheName, transferableBuffer(tail), hookId);
+                callerResponseStreamChunk(cacheName, transferableBuffer(tail), hookId, NO_ERROR, requestId);
                 bytesReceived += tail.byteLength;
               } else {
-                callerResponseStreamChunk(cacheName, transferableBuffer(value), hookId);
+                callerResponseStreamChunk(cacheName, transferableBuffer(value), hookId, NO_ERROR, requestId);
                 bytesReceived += value.byteLength;
               }
             }
             break;
           } catch (err) {
-            streamError =
-              (err as Error).name === "AbortError" ? makeError("Request aborted") : makeError((err as Error).message);
+            if ((err as Error).name === "AbortError") {
+              streamError = makeError("Request aborted", abortedByTimeout ? "timeout" : "aborted");
+              isPermanentError = true;
+              break;
+            }
+            streamError = makeError((err as Error).message, "network");
             if (attempt === maxRetries) break;
           }
+          if (isPermanentError) break;
           attempt++;
         }
-        callerResponseStreamEnd(cacheName, hookId, streamError);
+        callerResponseStreamEnd(cacheName, hookId, streamError, requestId);
         return;
       }
 
       const response = await fetch(url, fetchOptions);
 
       if (response.status >= 400) {
-        callerResponse(cacheName, null, hookId, response.status, makeError(response.statusText || DEFAULT_ERROR));
+        callerResponse(
+          cacheName,
+          null,
+          hookId,
+          response.status,
+          makeError(response.statusText || DEFAULT_ERROR, "http"),
+          "result",
+          requestId,
+        );
         return;
       }
 
       if (response.status === 204) {
         set(cacheName, null); // set() normalizes internally - avoid double-normalizing here
-        callerResponse(cacheName, null, hookId, 204);
+        callerResponse(cacheName, null, hookId, 204, NO_ERROR, "result", requestId);
         return;
       }
 
@@ -572,39 +671,55 @@ const apiRequest = async <TData>(
           },
           hookId,
           response.status,
+          NO_ERROR,
+          requestId,
         );
       } else {
-        commit(cacheName, responseData, hookId, response.status);
+        commit(cacheName, responseData, hookId, response.status, requestId);
       }
     } catch (error) {
       if ((error as Error).name === "AbortError") {
-        callerResponse(cacheName, null, hookId, undefined, makeError("Request aborted"));
+        callerResponse(
+          cacheName,
+          null,
+          hookId,
+          undefined,
+          makeError("Request aborted", abortedByTimeout ? "timeout" : "aborted"),
+          "result",
+          requestId,
+        );
         return;
       }
       const err = error as Error;
-      callerResponse(cacheName, null, hookId, undefined, makeError(err.message));
+      callerResponse(cacheName, null, hookId, undefined, makeError(err.message, "network"), "result", requestId);
     } finally {
       if (timeoutId != null) clearTimeout(timeoutId);
-      if (requestId) {
-        inFlightControllers.delete(requestId);
+      for (const id of requestIds) {
+        requestIdToCacheName.delete(id);
       }
-      inFlightByCacheName.delete(cacheName);
+      inFlightByCacheName.delete(inflightKey);
     }
   })();
 
-  if (!skipInFlightDedupe) {
-    inFlightByCacheName.set(cacheName, promise);
-  }
+  const entry: InFlightEntry = { promise, controller, requestIds };
+  inFlightByCacheName.set(inflightKey, entry);
 
   await promise;
 };
 
 const onRequest = <TData>(dataRequest: DataRequest<TData>): void => {
   const { cacheName, type, payload, request, requestId, hookId } = dataRequest;
-  const responseCacheName = dataRequest.cacheName ?? "";
 
   if (!isNonEmptyString(type)) {
-    callerResponse(responseCacheName, null, hookId, undefined, makeError("Invalid request: type is required"));
+    callerResponse(
+      cacheName ?? "",
+      null,
+      hookId,
+      undefined,
+      makeError("Invalid request: type is required", "validation"),
+      "result",
+      requestId,
+    );
     return;
   }
   const lowerType = normalizeKey(type);
@@ -615,7 +730,15 @@ const onRequest = <TData>(dataRequest: DataRequest<TData>): void => {
   }
 
   if (!isNonEmptyString(cacheName)) {
-    callerResponse(responseCacheName, null, hookId, undefined, makeError("Invalid request: cacheName is required"));
+    callerResponse(
+      cacheName ?? "",
+      null,
+      hookId,
+      undefined,
+      makeError("Invalid request: cacheName is required", "validation"),
+      "result",
+      requestId,
+    );
     return;
   }
   const lowerCacheName = normalizeKey(cacheName);
@@ -623,19 +746,29 @@ const onRequest = <TData>(dataRequest: DataRequest<TData>): void => {
   if (lowerType === "get") {
     const requestedData = get(lowerCacheName);
     if (requestedData === undefined) {
-      callerResponse(lowerCacheName, null, hookId, undefined, makeError("Cache miss"));
+      callerResponse(
+        lowerCacheName,
+        null,
+        hookId,
+        undefined,
+        makeError("Cache miss", "validation"),
+        "result",
+        requestId,
+      );
     } else {
-      callerResponse(lowerCacheName, requestedData, hookId);
+      callerResponse(lowerCacheName, requestedData, hookId, undefined, NO_ERROR, "result", requestId);
     }
   } else if (lowerType === "set") {
     if (!request) {
       if (payload == null) {
         callerResponse(
-          responseCacheName,
+          cacheName ?? "",
           null,
           hookId,
           undefined,
-          makeError("Invalid request: payload is required for set"),
+          makeError("Invalid request: payload is required for set", "validation"),
+          "result",
+          requestId,
         );
         return;
       }
@@ -644,11 +777,13 @@ const onRequest = <TData>(dataRequest: DataRequest<TData>): void => {
       const methodLower = normalizeKey(request.method);
       if (methodLower !== "get" && payload == null) {
         callerResponse(
-          responseCacheName,
+          cacheName ?? "",
           null,
           hookId,
           undefined,
-          makeError("Invalid request: payload is required for non-GET API request"),
+          makeError("Invalid request: payload is required for non-GET API request", "validation"),
+          "result",
+          requestId,
         );
         return;
       }
@@ -656,23 +791,39 @@ const onRequest = <TData>(dataRequest: DataRequest<TData>): void => {
     }
   } else if (lowerType === "delete") {
     remove(lowerCacheName);
-    callerResponse(lowerCacheName, { deleted: true }, hookId);
+    callerResponse(lowerCacheName, null, hookId, undefined, NO_ERROR, "delete", requestId);
   }
 };
 
-/**
- * Aborts the in-flight request registered under requestId, if any. Note: if that request was
- * joined/deduped by another caller via inFlightByCacheName (same cacheName, request already in
- * flight), this only aborts the original request's controller - the joined caller was never
- * registered with its own controller/requestId, so it has nothing to cancel independently.
- */
 const onCancel = (requestId: string): void => {
-  const controller = inFlightControllers.get(requestId);
-  if (controller) {
-    controller.abort();
-    inFlightControllers.delete(requestId);
+  const inflightKey = requestIdToCacheName.get(requestId);
+  if (!inflightKey) return;
+
+  const entry = inFlightByCacheName.get(inflightKey);
+  if (!entry) {
+    requestIdToCacheName.delete(requestId);
+    return;
+  }
+
+  entry.requestIds.delete(requestId);
+  requestIdToCacheName.delete(requestId);
+
+  if (entry.requestIds.size === 0) {
+    entry.controller.abort();
   }
 };
+
+const runStaleStoreCleanup = (): void => {
+  const now = Date.now();
+  for (const [key, lastAccessAt] of storeActivity) {
+    if (now - lastAccessAt < STALE_ENTRY_MS) continue;
+    if (inFlightByCacheName.has(key)) continue;
+    delete store[key];
+    storeActivity.delete(key);
+  }
+};
+
+setInterval(runStaleStoreCleanup, CLEANUP_INTERVAL_MS);
 
 /**
  * Incoming messages from the main thread. Expects payload shape { dataRequest?: DataRequest }.

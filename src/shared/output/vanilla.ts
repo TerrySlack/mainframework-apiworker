@@ -5,11 +5,12 @@ export type {
   BinaryResponseMeta,
   WorkerMessagePayload,
   WorkerErrorPayload,
+  WorkerErrorCode,
+  WorkerResponseType,
   WorkerResponseMessage,
   ResponseType,
   RunMode,
   WorkerDataRequestType,
   WorkerMessageData,
   BinaryParseResult,
-  ContentType,
 } from "../types/types";

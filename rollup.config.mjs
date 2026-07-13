@@ -2,6 +2,7 @@ import resolve from "@rollup/plugin-node-resolve";
 import esbuild from "rollup-plugin-esbuild";
 import replace from "@rollup/plugin-replace";
 import { dts } from "rollup-plugin-dts";
+import babel from "@rollup/plugin-babel";
 
 const jsConfig = {
   input: {
@@ -25,11 +26,20 @@ const jsConfig = {
         '"use client";': "",
       },
     }),
+    resolve(),
+    babel({
+      include: ["**/hooks/useApiWorker.ts"],
+      plugins: [
+        "@babel/plugin-syntax-typescript",
+        ["babel-plugin-react-compiler", {}],
+      ],
+      extensions: [".ts", ".tsx"],
+      babelHelpers: "bundled",
+    }),
     esbuild({
       include: /\.[jt]sx?$/,
       tsconfig: "tsconfig.rollup.json",
     }),
-    resolve(),
   ],
   external: ["react"],
 };
@@ -43,6 +53,7 @@ const dtsConfig = {
     dir: "dist",
     entryFileNames: "shared/output/[name].d.ts",
   },
+  external: ["react"],
   plugins: [
     dts({
       tsconfig: "tsconfig.rollup.json",

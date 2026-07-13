@@ -1,4 +1,7 @@
-/** When "binary" or "stream", in-flight dedupe is skipped so we always run the request and return real response (no stale). */
+/**
+ * When "binary" or "stream", in-flight dedupe is skipped so we always run the request and return real response (no stale).
+ * Note: does not affect response parsing — Content-Type always governs the parse path.
+ */
 export type ResponseType = "json" | "binary" | "stream";
 
 export interface RequestConfig {
@@ -7,7 +10,7 @@ export interface RequestConfig {
   mode?: "cors" | "no-cors" | "navigate" | "same-origin";
   headers?: Record<string, string>;
   credentials?: "include" | "same-origin" | "omit";
-  /** Omit or "json": allow in-flight dedupe. "binary" or "stream": no early return, always process request. */
+  /** Omit or "json": allow in-flight dedupe. "binary" or "stream": no early return, always process request. Does not affect response parsing — Content-Type always governs the parse path. */
   responseType?: ResponseType;
   /** Abort request after this many milliseconds. */
   timeoutMs?: number;
@@ -59,9 +62,14 @@ export type BinaryParseResult = {
   contentType: string;
 } & Pick<BinaryResponseMeta, "contentDisposition">;
 
+export type WorkerResponseType = "result" | "delete" | "stream";
+
+export type WorkerErrorCode = "aborted" | "timeout" | "http" | "network" | "validation";
+
 /** Worker always sends this shape; no error = { message: "" }. */
 export interface WorkerErrorPayload {
   message: string;
+  code?: WorkerErrorCode;
 }
 
 export interface QueueEntry<T> {
@@ -71,7 +79,8 @@ export interface QueueEntry<T> {
   data: T | null;
   meta: BinaryResponseMeta | null;
   error: string | null;
-  setUpdateTrigger: ((value: number | ((prev: number) => number)) => void) | null;
+  errorCode: WorkerErrorCode | null;
+  setUpdateTriggers: Set<(value: number | ((prev: number) => number)) => void>;
   requestId: string | null;
   lastActivityAt: number | null;
   /** For responseType "stream": batch of chunks since last flush. Absent for non-stream. */
@@ -85,6 +94,7 @@ export interface UseApiWorkerReturn<T> {
   meta: BinaryResponseMeta | null;
   loading: boolean;
   error: string | null;
+  errorCode: WorkerErrorCode | null;
   refetch: () => void;
   deleteCache: () => void;
   /** For responseType "stream": batch of chunks since last flush. Undefined for non-stream. */
@@ -93,44 +103,20 @@ export interface UseApiWorkerReturn<T> {
 
 export type AbortControllers = Map<string, AbortController>;
 
-/**
- * Worker response messages. Use in client onmessage handler:
- * - data + meta: binary response (data is ArrayBuffer). Reconstruct: new Blob([data], { type: meta?.contentType })
- * - data only: JSON/text response
- * - stream: "start" | "chunk" | "end" — client handles chunk sequence then finalizes
- * - error: error response with message and code
- */
-export type WorkerResponseMessage =
-  | { cacheName: string; data: unknown; error: WorkerErrorPayload }
-  | { cacheName: string; data: ArrayBuffer; meta: BinaryResponseMeta; error: WorkerErrorPayload }
-  | { cacheName: string; error: WorkerErrorPayload }
-  | {
-      cacheName: string;
-      stream: "start";
-      meta: BinaryResponseMeta | null;
-      hookId?: string;
-      httpStatus?: number;
-      error: WorkerErrorPayload;
-    }
-  | {
-      cacheName: string;
-      stream: "resume";
-      meta: BinaryResponseMeta | null;
-      hookId?: string;
-      httpStatus?: number;
-      error: WorkerErrorPayload;
-    }
-  | { cacheName: string; stream: "chunk"; data: ArrayBuffer; hookId?: string; error: WorkerErrorPayload }
-  | { cacheName: string; stream: "end"; hookId?: string; error: WorkerErrorPayload };
+/** @deprecated Use WorkerMessagePayload. */
+export type WorkerResponseMessage = WorkerMessagePayload;
 
 /**
  * Payload shape for worker postMessage. Use for client onmessage:
  * MessageEvent<WorkerMessagePayload>. The worker always sends error (same shape: { message: string }).
  * No error = { message: "" }. With error = { message: "..." }.
+ * `type` disambiguates result, delete-ack, and stream messages. `requestId` echoes the originating request.
  * When stream is present, client receives start → chunk(s) → end; cancel via existing requestId/cancel.
  */
 export type WorkerMessagePayload =
   | {
+      type: "result" | "delete";
+      requestId?: string;
       cacheName?: string;
       data?: unknown;
       meta?: BinaryResponseMeta;
@@ -139,6 +125,8 @@ export type WorkerMessagePayload =
       httpStatus?: number;
     }
   | {
+      type: "stream";
+      requestId?: string;
       cacheName: string;
       stream: "start";
       meta: BinaryResponseMeta | null;
@@ -147,6 +135,8 @@ export type WorkerMessagePayload =
       error: WorkerErrorPayload;
     }
   | {
+      type: "stream";
+      requestId?: string;
       cacheName: string;
       stream: "resume";
       meta: BinaryResponseMeta | null;
@@ -154,70 +144,22 @@ export type WorkerMessagePayload =
       httpStatus?: number;
       error: WorkerErrorPayload;
     }
-  | { cacheName: string; stream: "chunk"; data: ArrayBuffer; hookId?: string; error: WorkerErrorPayload }
-  | { cacheName: string; stream: "end"; hookId?: string; error: WorkerErrorPayload };
-
-export interface StackArray {
-  key: string;
-  value: unknown;
-}
-
-//Use this in the hook to show the engineer what kind of content type to use
-export type ContentType =
-  // Application types
-  | "application/json"
-  | "application/xml"
-  | "application/x-www-form-urlencoded"
-  | "application/pdf"
-  | "application/zip"
-  | "application/gzip"
-  | "application/octet-stream"
-  | "application/javascript"
-  | "application/ld+json"
-  | "application/vnd.api+json"
-  | "application/vnd.ms-excel"
-  | "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-  | "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-  | "application/vnd.openxmlformats-officedocument.presentationml.presentation"
-  // Text types
-  | "text/plain"
-  | "text/html"
-  | "text/css"
-  | "text/csv"
-  | "text/javascript"
-  | "text/xml"
-  // Image types
-  | "image/jpeg"
-  | "image/png"
-  | "image/gif"
-  | "image/svg+xml"
-  | "image/webp"
-  | "image/bmp"
-  | "image/tiff"
-  | "image/x-icon"
-  | "image/avif"
-  // Audio types
-  | "audio/mpeg"
-  | "audio/ogg"
-  | "audio/wav"
-  | "audio/webm"
-  | "audio/aac"
-  | "audio/midi"
-  // Video types
-  | "video/mp4"
-  | "video/mpeg"
-  | "video/webm"
-  | "video/ogg"
-  | "video/quicktime"
-  | "video/x-msvideo"
-  // Multipart types
-  | "multipart/form-data"
-  | "multipart/mixed"
-  | "multipart/alternative"
-  // Font types
-  | "font/woff"
-  | "font/woff2"
-  | "font/ttf"
-  | "font/otf";
+  | {
+      type: "stream";
+      requestId?: string;
+      cacheName: string;
+      stream: "chunk";
+      data: ArrayBuffer;
+      hookId?: string;
+      error: WorkerErrorPayload;
+    }
+  | {
+      type: "stream";
+      requestId?: string;
+      cacheName: string;
+      stream: "end";
+      hookId?: string;
+      error: WorkerErrorPayload;
+    };
 
 export type WorkerMessageData = { dataRequest?: DataRequest<unknown> };

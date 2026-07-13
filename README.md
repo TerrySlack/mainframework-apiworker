@@ -23,13 +23,15 @@ The library is **framework- and library-agnostic**: you use the worker via the s
 
 ## Response Types and Download Behavior
 
-The library supports three response types to handle different use cases:
+`responseType` controls in-flight deduplication and streaming behavior. For non-stream requests, **response parsing follows the server's `Content-Type` header**, not `responseType` — a GET without `responseType: "binary"` can still return an `ArrayBuffer` when the server sends a binary content type.
 
-- **`responseType: "json"`** (default): Full response is buffered in the worker and sent to the client in a single message. The client receives the complete response (JSON or text) after the entire download completes.
+| `responseType`               | Effect                                                                                                                                     |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| omitted / `"json"` (default) | In-flight dedupe enabled (keyed by `cacheName`). Full response buffered and sent in one `type: "result"` message.                          |
+| `"binary"`                   | Skips in-flight dedupe (always fetches fresh). Response still parsed by `Content-Type`; binary bodies arrive as `ArrayBuffer` with `meta`. |
+| `"stream"`                   | Enables incremental delivery (`start` → `chunk` → ... → `end`), Range-based retries, and hook `streamChunks`.                              |
 
-- **`responseType: "binary"`**: Full binary response is buffered in the worker and sent as an `ArrayBuffer` in a single message. Perfect for complete binary files like images, PDFs, or downloadable documents.
-
-- **`responseType: "stream"`**: Responses are streamed incrementally to the client. The worker sends chunks as they arrive (`start` → `chunk` → `chunk` → ... → `end`), enabling playback of audio/video streams to begin before the full file downloads. The React hook returns `streamChunks` (batches of `ArrayBuffer[]`) as they arrive and a final `Blob` in `data` when complete. Throttling (default: every 5 chunks or 50ms) minimizes re-renders. For vanilla JavaScript, you handle stream events manually for maximum control.
+- **`responseType: "stream"`**: The worker sends chunks as they arrive, enabling audio/video playback before the full file downloads. The React hook exposes the latest flushed batch in `streamChunks` (`ArrayBuffer[]`) and a final `Blob` in `data` when complete. Throttling (default: every 5 chunks, configurable via `streamChunkBatchSize`) minimizes re-renders. For vanilla JavaScript, handle `type: "stream"` messages manually.
 
 Binary and stream responses are not stored in the worker cache; only json/text responses are cached.
 
@@ -101,10 +103,10 @@ worker.postMessage({
 
 Use only these import paths. Do not import the worker script directly.
 
-| Use case    | Import from                               | What you get                                                                                                              |
-| ----------- | ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
-| **Vanilla** | `@mainframework/api-request-worker`       | `createApiWorker`, `RequestConfig`, `DataRequest`, `BinaryResponseMeta`, `WorkerMessagePayload`, and other protocol types |
-| **React**   | `@mainframework/api-request-worker/react` | `useApiWorker`, `RequestConfig`, hook types                                                                               |
+| Use case    | Import from                               | What you get                                                                                                                                                       |
+| ----------- | ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Vanilla** | `@mainframework/api-request-worker`       | `createApiWorker`, `RequestConfig`, `DataRequest`, `BinaryResponseMeta`, `WorkerMessagePayload`, `WorkerErrorCode`, `WorkerResponseType`, and other protocol types |
+| **React**   | `@mainframework/api-request-worker/react` | `useApiWorker`, `RequestConfig`, `UseApiWorkerConfig`, `UseApiWorkerReturn`                                                                                        |
 
 The worker is not a public entry. Obtain it only by calling `createApiWorker()` from the main package (or use the React hook, which uses `createApiWorker` internally).
 
@@ -119,6 +121,7 @@ The worker is not a public entry. Obtain it only by calling `createApiWorker()` 
 - **Next.js**: Use **client-only** code paths.
   - Add `"use client";` at the top of any file that imports `@mainframework/api-request-worker/react`.
   - Do not call `createApiWorker()` during SSR.
+  - `useApiWorker` returns `null` when `window` is undefined — guard before destructuring in SSR or shared modules.
 
 ---
 
@@ -160,21 +163,49 @@ Send a single object: `{ dataRequest: { ... } }`.
 
 **Incoming messages (worker → main thread):**
 
-Every message includes `error: { message: string }`.
+Every message includes:
 
-- **Success**: `data` contains the response body and `error.message` is `""` (empty string).
-- **Failure**: `data` is `null` and `error.message` contains the error description.
+- **`type`**: `"result"` | `"delete"` | `"stream"` — disambiguates delete acknowledgements from real payloads and stream events.
+- **`requestId`**: Echoes the originating request when present; omitted for cache-only `get` / `delete` without a client `requestId`.
+- **`error`**: `{ message: string; code?: WorkerErrorCode }` — always present.
+
+- **Success**: `type: "result"`, `data` contains the response body, `error.message` is `""` (empty string).
+- **Failure**: `type: "result"`, `data` is `null`, `error.message` contains the error description, optional `error.code` classifies the failure.
+- **Delete ack**: `type: "delete"`, `data: null`, `error: { message: "" }` — the `type` field is the signal; there is no `{ deleted: true }` payload.
+
+**Error codes (`error.code`):**
+
+| Code           | When                                            |
+| -------------- | ----------------------------------------------- |
+| `"aborted"`    | Manual `cancel` or `AbortError` without timeout |
+| `"timeout"`    | `timeoutMs` fired                               |
+| `"http"`       | HTTP status ≥ 400                               |
+| `"network"`    | Fetch, parse, or other runtime failure          |
+| `"validation"` | Cache miss, invalid request, etc.               |
 
 **Message formats:**
 
-- **Success (JSON/text):** `{ cacheName, data, error: { message: "" }, hookId?, httpStatus? }`
-- **Success (binary):** `{ cacheName, data: ArrayBuffer, meta: { contentType?, contentDisposition }, error: { message: "" }, hookId?, httpStatus? }`
+- **Success (JSON/text):** `{ type: "result", cacheName, data, error: { message: "" }, requestId?, hookId?, httpStatus? }`
+- **Success (binary):** `{ type: "result", cacheName, data: ArrayBuffer, meta: { contentType?, contentDisposition }, error: { message: "" }, requestId?, hookId?, httpStatus? }`
+- **Delete ack:** `{ type: "delete", cacheName, data: null, error: { message: "" }, requestId?, hookId? }`
 - **Success (stream):** Multiple messages in sequence:
-  - `{ cacheName, stream: "start", meta: { contentType?, contentDisposition }, hookId?, httpStatus?, error: { message: "" } }`
-  - `{ cacheName, stream: "chunk", data: ArrayBuffer, hookId?, error: { message: "" } }` (one or more)
-  - `{ cacheName, stream: "resume", meta: { contentType?, contentDisposition }, hookId?, httpStatus?, error: { message: "" } }` (after retry)
-  - `{ cacheName, stream: "end", hookId?, error: { message: "" } }` (final message)
-- **Error:** `{ cacheName?, data: null, error: { message: "..." }, hookId? }`. If the request had no `cacheName`, match by `hookId` instead.
+  - `{ type: "stream", cacheName, stream: "start", meta: { contentType?, contentDisposition }, requestId?, hookId?, httpStatus?, error: { message: "" } }`
+  - `{ type: "stream", cacheName, stream: "chunk", data: ArrayBuffer, requestId?, hookId?, error: { message: "" } }` (one or more)
+  - `{ type: "stream", cacheName, stream: "resume", meta: { contentType?, contentDisposition }, requestId?, hookId?, httpStatus?, error: { message: "" } }` (after retry)
+  - `{ type: "stream", cacheName, stream: "end", requestId?, hookId?, error: { message: "" } }` (final message)
+- **Error:** `{ type: "result", cacheName?, data: null, error: { message: "...", code?: "..." }, requestId?, hookId? }`. If the request had no `cacheName`, match by `hookId` instead.
+
+**Design notes:**
+
+| #   | Note                                                                                                                                                                                                                          |
+| --- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 7   | In-flight dedupe for json/text is keyed by `cacheName` only (not HTTP method). Two concurrent mutations on the same key coalesce — intentional for read caching; use distinct `cacheName` values for independent writes.      |
+| 8   | `retries` applies only when `responseType: "stream"`.                                                                                                                                                                         |
+| 9   | Auto-run refires when `data` / `request` object identity changes — callers must memoize inline literals.                                                                                                                      |
+| 10  | `streamChunks` exposes the latest flushed batch (`ArrayBuffer[]`), not the cumulative stream — accumulate in consumer if needed.                                                                                              |
+| 11  | Joiners on a deduped json/text fetch may receive **two** `type: "result"` messages: cached value immediately, then fresh value after the shared fetch completes. Vanilla consumers should handle or ignore the first message. |
+
+**Joiner cancel:** Multiple subscribers sharing a `cacheName` coalesce into one in-flight fetch (json/text). Each caller registers its own `requestId`. Cancel removes only that `requestId`; the shared fetch is aborted only when the last registered `requestId` is cancelled. For `responseType: "binary"` or `"stream"`, in-flight tracking is keyed by `requestId` (not `cacheName`), so those requests do not dedupe across callers.
 
 **Common error messages:**
 
@@ -203,9 +234,15 @@ interface RequestConfig {
 }
 ```
 
-- **`responseType: "binary"`**: Use for complete binary files. The worker returns an `ArrayBuffer` and sets `meta.contentType` and `meta.contentDisposition` so you can construct a proper `Blob`: `new Blob([data], { type: meta?.contentType })`.
+- **`responseType: "binary"`**: Skips in-flight dedupe so each request fetches fresh data. Response parsing still follows `Content-Type`; when the server returns binary content, the worker sends an `ArrayBuffer` with `meta.contentType` and `meta.contentDisposition` so you can construct a `Blob`: `new Blob([data], { type: meta?.contentType })`.
 
-- **`responseType: "stream"`**: Use for streaming audio/video or large files. The worker sends chunks incrementally. The hook returns `streamChunks` (batches of `ArrayBuffer[]`) as they arrive and a final `Blob` in `data` when complete. Batching via `streamChunkBatchSize` (default 5) controls how many chunks are delivered per update. Supports automatic reconnection with configurable retries (default 3, max 5).
+- **`responseType: "stream"`**: Enables incremental chunk delivery. The hook exposes the latest flushed batch in `streamChunks` (`ArrayBuffer[]`) and a final `Blob` in `data` when complete. Batching via `streamChunkBatchSize` (default 5) controls how many chunks are delivered per update. Supports automatic reconnection with configurable retries (default 3, max 5).
+
+- **`formDataFileFieldName`** (default `"Files"`): FormData field name for all `File`/`Blob` parts when the worker auto-builds multipart form data.
+
+- **`formDataKey`** (default `"Files"`): FormData key for the root payload object when building multipart form data.
+
+**File upload:** When a `set` payload contains `File` or `Blob` values (including nested in objects or arrays), the worker automatically sends the request as `multipart/form-data` and omits any caller `Content-Type` header so the browser sets the boundary. No manual `Content-Type: multipart/form-data` header is required.
 
 ### Vanilla JavaScript Examples
 
@@ -248,6 +285,24 @@ worker.postMessage({
       headers: { "Content-Type": "application/json" },
     },
     hookId: "vanilla-post",
+  },
+});
+```
+
+**POST request with file upload (auto multipart):**
+
+```ts
+worker.postMessage({
+  dataRequest: {
+    type: "set",
+    cacheName: "upload-" + Date.now(),
+    payload: { title: "My Photo", photos: [fileInput.files[0]] },
+    request: {
+      url: "https://api.example.com/upload",
+      method: "POST",
+      // No Content-Type header needed — worker detects File/Blob and sends multipart/form-data
+    },
+    hookId: "vanilla-upload",
   },
 });
 ```
@@ -300,7 +355,7 @@ setTimeout(() => {
 worker.postMessage({
   dataRequest: { type: "get", cacheName: "nonexistent-key", hookId: "cache-miss" },
 });
-// onmessage receives: { cacheName: "nonexistent-key", data: null, error: { message: "Cache miss" }, hookId: "cache-miss" }
+// onmessage receives: { type: "result", cacheName: "nonexistent-key", data: null, error: { message: "Cache miss", code: "validation" }, hookId: "cache-miss" }
 ```
 
 **Delete cached data:**
@@ -315,7 +370,7 @@ worker.postMessage({
 worker.postMessage({
   dataRequest: { type: "delete", cacheName: "temp-data", hookId: "delete-op" },
 });
-// Response: { cacheName: "temp-data", data: { deleted: true }, error: { message: "" }, hookId: "delete-op" }
+// Response: { type: "delete", cacheName: "temp-data", data: null, error: { message: "" }, hookId: "delete-op" }
 
 // Subsequent get for the same cacheName returns: { error: { message: "Cache miss" } }
 ```
@@ -360,7 +415,7 @@ let meta: { contentType?: string; contentDisposition: string | null } | null = n
 
 worker.onmessage = (event) => {
   const msg = event.data;
-  if (msg.cacheName !== cacheName) return;
+  if (msg.cacheName !== cacheName || msg.type !== "stream") return;
 
   if (msg.stream === "start") {
     // Stream started
@@ -477,7 +532,8 @@ const result = useApiWorker({
   enabled: true,               // optional: if false, no request is sent (default true)
 });
 
-// result: { data, meta, loading, error, refetch, deleteCache }
+// result: UseApiWorkerReturn<T> | null — null when window is undefined (SSR)
+// { data, meta, loading, error, errorCode, refetch, deleteCache, streamChunks? }
 ```
 
 **Parameters:**
@@ -493,15 +549,16 @@ const result = useApiWorker({
 
 **Return value:**
 
-| Property       | Type                         | Description                                                                                                                                   |
-| -------------- | ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| `data`         | `T \| null`                  | Response body: JSON/text for `responseType: "json"`, `ArrayBuffer` for `responseType: "binary"`, `Blob` for `responseType: "stream"`.         |
-| `meta`         | `BinaryResponseMeta \| null` | For binary and stream responses: `contentType`, `contentDisposition`.                                                                         |
-| `loading`      | `boolean`                    | `true` while a request is in flight.                                                                                                          |
-| `error`        | `string \| null`             | Error message when the request failed; `null` when there is no error. See [Errors](#errors).                                                  |
-| `refetch`      | `() => void`                 | Re-runs the same logical request. See [Refetch semantics](#refetch-semantics).                                                                |
-| `deleteCache`  | `() => void`                 | Tells the worker to delete the cache entry for this `cacheName`.                                                                              |
-| `streamChunks` | `ArrayBuffer[] \| undefined` | For `responseType: "stream"`: batches of chunks as they arrive. Append to `MediaSource` or process incrementally. `undefined` for non-stream. |
+| Property       | Type                         | Description                                                                                                                                     |
+| -------------- | ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `data`         | `T \| null`                  | Response body: JSON/text or `ArrayBuffer` per server `Content-Type`; `Blob` when `responseType: "stream"` completes.                            |
+| `meta`         | `BinaryResponseMeta \| null` | For binary and stream responses: `contentType`, `contentDisposition`.                                                                           |
+| `loading`      | `boolean`                    | `true` while a request is in flight.                                                                                                            |
+| `error`        | `string \| null`             | Error message when the request failed; `null` when there is no error. See [Errors](#errors).                                                    |
+| `errorCode`    | `WorkerErrorCode \| null`    | Structured error classification (`"aborted"`, `"timeout"`, `"http"`, `"network"`, `"validation"`); `null` when there is no error.               |
+| `refetch`      | `() => void`                 | Re-runs the same logical request. See [Refetch semantics](#refetch-semantics).                                                                  |
+| `deleteCache`  | `() => void`                 | Tells the worker to delete the cache entry for this `cacheName`.                                                                                |
+| `streamChunks` | `ArrayBuffer[] \| undefined` | For `responseType: "stream"`: the latest flushed batch of chunks. Append to `MediaSource` or process incrementally. `undefined` for non-stream. |
 
 ### React Examples
 
@@ -636,7 +693,7 @@ const { data, meta, loading, error, streamChunks } = useApiWorker({
   runMode: "auto",
 });
 
-// streamChunks: batches of ArrayBuffer[] as chunks arrive (append to MediaSource, etc.)
+// streamChunks: latest flushed batch (ArrayBuffer[]) as chunks arrive (append to MediaSource, etc.)
 // data: Blob when the stream completes
 // loading: true until stream ends
 // const videoUrl = data ? URL.createObjectURL(data) : null;
@@ -659,9 +716,11 @@ const handleClearCache = () => {
 
 ### Shared cacheName / Multiple Subscribers
 
-When multiple components use the same `cacheName`, they share a single cache entry in the worker. However, only one queue entry exists per normalized cache name, and the last-mounted component's state updater receives the worker's responses. This means only that component will re-render when the worker responds.
+When multiple components use the same `cacheName`, they share a single client queue entry and a single worker cache key. All mounted subscribers register on that entry; when the worker responds, **all subscribers re-render** with the same `data`, `loading`, and `error` state.
 
-**Recommendation:** Use unique `cacheName` values per logical resource if you need independent `loading`/`error` state in each component.
+**Recommendation:** Use distinct `cacheName` values when components need independent state, different `request` configs, or separate `loading`/`error` tracking.
+
+**Unmount cancel:** When a component unmounts, its in-flight `requestId` is cancelled only if it is the last subscriber for that `cacheName`. Other subscribers keep the shared fetch alive.
 
 ### Refetch Semantics
 
@@ -674,15 +733,16 @@ It does not switch between get and set based on prior runs; it uses the current 
 
 ### Errors
 
-The worker always includes an `error` field in every message: `{ message: string }`.
+The worker always includes an `error` field in every message: `{ message: string; code?: WorkerErrorCode }`.
 
 - **No error**: `{ message: "" }` (empty string)
-- **Error occurred**: `{ message: "error description" }`
+- **Error occurred**: `{ message: "error description", code?: "aborted" | "timeout" | "http" | "network" | "validation" }`
 
-The hook exposes this as `error: string | null`:
+The hook exposes this as `error: string | null` and `errorCode: WorkerErrorCode | null`:
 
 - `null` when `error.message` is empty
 - The error message string when an error occurred
+- `errorCode` mirrors `error.code` when present
 
 Common error messages:
 
@@ -705,13 +765,14 @@ import type {
   BinaryResponseMeta,
   WorkerMessagePayload,
   WorkerErrorPayload,
+  WorkerErrorCode,
+  WorkerResponseType,
   WorkerResponseMessage,
   ResponseType,
   RunMode,
   WorkerDataRequestType,
   WorkerMessageData,
   BinaryParseResult,
-  ContentType,
 } from "@mainframework/api-request-worker";
 ```
 
@@ -729,10 +790,10 @@ import type { RequestConfig, UseApiWorkerConfig, UseApiWorkerReturn } from "@mai
 
 ## Quick Reference
 
-| Use case          | Entry point                               | Primary API                                                                                                                 |
-| ----------------- | ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| **Vanilla JS/TS** | `@mainframework/api-request-worker`       | `createApiWorker()`; set `worker.onmessage`, use `worker.postMessage`                                                       |
-| **React**         | `@mainframework/api-request-worker/react` | `useApiWorker({ cacheName, request?, data?, runMode?, enabled? })` → `{ data, meta, loading, error, refetch, deleteCache }` |
+| Use case          | Entry point                               | Primary API                                                                                                                                                                                       |
+| ----------------- | ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Vanilla JS/TS** | `@mainframework/api-request-worker`       | `createApiWorker()`; set `worker.onmessage`, use `worker.postMessage`                                                                                                                             |
+| **React**         | `@mainframework/api-request-worker/react` | `useApiWorker({ cacheName, request?, data?, runMode?, enabled? })` → `UseApiWorkerReturn<T> \| null` (`data`, `meta`, `loading`, `error`, `errorCode`, `refetch`, `deleteCache`, `streamChunks?`) |
 
 ---
 
@@ -746,13 +807,16 @@ import type { RequestConfig, UseApiWorkerConfig, UseApiWorkerReturn } from "@mai
 
 ---
 
-## Testing
+## Changelog
 
-Tests use Vitest in browser mode (Playwright Chromium). The worker is created inside `useApiWorker`; there are no mocks.
+### 1.1.0
 
-- **useApiWorker** — `src/shared/hooks/useApiWorker.test.ts` (React hook, real Worker and network)
-
-Run tests: `yarn test` (or `yarn test:watch`, `yarn test:coverage`). Ensure Chromium is installed: `npx playwright install chromium`.
+- Added `type` and `requestId` to all worker→main messages for protocol disambiguation and request correlation.
+- Added structured `error.code` (`WorkerErrorCode`) alongside existing `error.message`.
+- Delete responses now use `type: "delete"` with `data: null` instead of `{ deleted: true }` — **breaking** for consumers relying on the old delete payload shape.
+- Joiner-aware cancel: shared in-flight fetches track multiple `requestId`s; abort only when the last subscriber cancels.
+- Last-activity eviction for idle queue entries (client) and cache store entries (worker).
+- Stream `responseType` detection in the React hook now uses `toLocaleLowerCase()` consistently (was `toLowerCase()`).
 
 ---
 
