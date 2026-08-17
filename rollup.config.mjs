@@ -1,64 +1,28 @@
-import resolve from "@rollup/plugin-node-resolve";
-import esbuild from "rollup-plugin-esbuild";
-import replace from "@rollup/plugin-replace";
-import { dts } from "rollup-plugin-dts";
-import babel from "@rollup/plugin-babel";
+import typescript from "@rollup/plugin-typescript";
+import { nodeResolve } from "@rollup/plugin-node-resolve";
+import  terser  from "@rollup/plugin-terser";
+import dts from "rollup-plugin-dts";
 
-const jsConfig = {
-  input: {
-    vanilla: "src/shared/output/vanilla.ts",
-    react: "src/shared/output/react.ts",
-    "api.worker": "src/shared/workers/api/api.worker.ts",
+export default [
+  // JS build (ESM)
+  {
+    input: "src/index.ts",
+    output: {
+      file: "dist/index.mjs",
+      format: "esm",
+      sourcemap: true,
+    },
+    plugins: [nodeResolve(), typescript({ tsconfig: "./tsconfig.json" }), terser()],
+    external: ["react"], // put external deps here if any
   },
-  output: {
-    dir: "dist",
-    format: "esm",
-    entryFileNames: (chunkInfo) =>
-      chunkInfo.name === "api.worker"
-        ? "workers/api/api.worker.js"
-        : "shared/output/[name].js",
-    sourcemap: true,
+  // DTS build
+  {
+    input: "src/index.ts",
+    output: {
+      file: "dist/index.d.ts",
+      format: "esm",
+    },
+    plugins: [dts()],
   },
-  plugins: [
-    replace({
-      preventAssignment: true,
-      values: {
-        '"use client";': "",
-      },
-    }),
-    resolve(),
-    babel({
-      include: ["**/hooks/useApiWorker.ts"],
-      plugins: [
-        "@babel/plugin-syntax-typescript",
-        ["babel-plugin-react-compiler", {}],
-      ],
-      extensions: [".ts", ".tsx"],
-      babelHelpers: "bundled",
-    }),
-    esbuild({
-      include: /\.[jt]sx?$/,
-      tsconfig: "tsconfig.rollup.json",
-    }),
-  ],
-  external: ["react"],
-};
+];
 
-const dtsConfig = {
-  input: {
-    vanilla: "src/shared/output/vanilla.ts",
-    react: "src/shared/output/react.ts",
-  },
-  output: {
-    dir: "dist",
-    entryFileNames: "shared/output/[name].d.ts",
-  },
-  external: ["react"],
-  plugins: [
-    dts({
-      tsconfig: "tsconfig.rollup.json",
-    }),
-  ],
-};
-
-export default [jsConfig, dtsConfig];

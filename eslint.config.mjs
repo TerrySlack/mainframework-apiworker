@@ -20,6 +20,7 @@ export default [
       "package-lock.json",
       "yarn.lock",
       "jest.worker-setup.ts",
+      "pnpm-lock.yaml"
     ],
   },
 
