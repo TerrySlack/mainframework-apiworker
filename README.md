@@ -42,7 +42,7 @@ Binary and stream responses are not stored in the worker cache; only json/text r
 ```bash
 npm i @mainframework/api-request-worker
 # or
-yarn add @mainframework/api-request-worker
+pnpm add @mainframework/api-request-worker
 ```
 
 If you use the optional React hook, a peer dependency `react >= 19` is required.
