@@ -224,16 +224,29 @@ const ensureWorkerInitialized = (): Worker => {
 export type { RequestConfig, UseApiWorkerConfig, UseApiWorkerReturn } from "../types/types";
 
 export const useApiWorker = <T>(config: UseApiWorkerConfig): UseApiWorkerReturn<T> | null => {
-  if (!window) return null;
-  const { cacheName, request: requestConfig, data: configData, runMode = "auto", enabled = true } = config;
-
+  const hasExecutedRef = useRef(false);
+  const [, setUpdateTrigger] = useState(0);
   const worker = ensureWorkerInitialized();
+  const { cacheName, request: requestConfig, data: configData, runMode = "auto", enabled = true } = config;
 
   const hookIdRef = useRef<string>("");
   const queueKey = normalizeKey(cacheName);
+  useEffect(() => {
+    responseQueue[queueKey]?.setUpdateTriggers.add(setUpdateTrigger);
+    return () => {
+      const storeEntry = responseQueue[queueKey];
+      if (!storeEntry) return;
+      storeEntry.setUpdateTriggers.delete(setUpdateTrigger);
+      if (storeEntry.setUpdateTriggers.size === 0) {
+        const requestId = storeEntry.requestId;
+        if (requestId) {
+          worker.postMessage({ dataRequest: { type: "cancel", cacheName, requestId } });
+        }
+      }
+    };
+  }, [queueKey, cacheName, worker]);
 
-  const hasExecutedRef = useRef(false);
-  const [, setUpdateTrigger] = useState(0);
+  if (!window) return null;
 
   let storeEntry = responseQueue[queueKey];
 
@@ -257,23 +270,7 @@ export const useApiWorker = <T>(config: UseApiWorkerConfig): UseApiWorkerReturn<
     storeEntry.lastActivityAt = Date.now();
   }
   const entry = storeEntry;
-
   const hookId = hookIdRef.current;
-
-  useEffect(() => {
-    responseQueue[queueKey]?.setUpdateTriggers.add(setUpdateTrigger);
-    return () => {
-      const storeEntry = responseQueue[queueKey];
-      if (!storeEntry) return;
-      storeEntry.setUpdateTriggers.delete(setUpdateTrigger);
-      if (storeEntry.setUpdateTriggers.size === 0) {
-        const requestId = storeEntry.requestId;
-        if (requestId) {
-          worker.postMessage({ dataRequest: { type: "cancel", cacheName, requestId } });
-        }
-      }
-    };
-  }, [queueKey, cacheName, worker]);
 
   const deleteCache = () => {
     if (cacheName) {
