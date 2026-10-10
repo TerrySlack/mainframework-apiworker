@@ -117,7 +117,7 @@ export type WorkerMessagePayload =
   | {
       type: "result" | "delete";
       requestId?: string;
-      cacheName?: string;
+      cacheName: string;
       data?: unknown;
       meta?: BinaryResponseMeta;
       error: WorkerErrorPayload;
