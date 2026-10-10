@@ -126,7 +126,7 @@ const ensureWorkerInitialized = (): Worker => {
     const cacheName = msg.cacheName;
     const hookId = msg.hookId;
     const error = msg.error;
-    const key = cacheName ? normalizeKey(cacheName) : "";
+    const key = normalizeKey(cacheName);
 
     if ("stream" in msg && msg.stream) {
       const entry = findEntry(cacheName, hookId);
@@ -246,7 +246,7 @@ export const useApiWorker = <T>(config: UseApiWorkerConfig): UseApiWorkerReturn<
     };
   }, [queueKey, cacheName, worker]);
 
-  if (!window) return null;
+  if (typeof window === "undefined") return null;
 
   let storeEntry = responseQueue[queueKey];
 
